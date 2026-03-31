@@ -8,6 +8,26 @@ namespace AgentOrchestrator.DiscordBot;
 
 public sealed class DiscordAgentBot
 {
+    private const string MissingPermissionsMessage =
+        "권한이 부족해서 작업을 진행하지 못했어요.\n" +
+        "봇에 아래 권한을 추가해 주세요.\n" +
+        "- Manage Channels\n" +
+        "- View Channels\n" +
+        "- Send Messages\n" +
+        "- Attach Files\n" +
+        "- Read Message History";
+
+    private const string MissingWorkspacePermissionsMessage =
+        "이 서버에서 프로젝트 채널을 만들 권한이 부족해요.\n" +
+        "봇 역할에 아래 권한을 추가해 주세요.\n" +
+        "- Manage Channels\n" +
+        "- View Channels\n" +
+        "- Send Messages\n" +
+        "- Attach Files\n" +
+        "- Read Message History";
+
+    private const string NoCompletedRunsMessage = "완료된 실행 기록이 아직 없어요.";
+
     private enum ApprovalActionKind
     {
         Ask,
@@ -166,14 +186,7 @@ public sealed class DiscordAgentBot
         }
         catch (HttpException httpException) when (httpException.DiscordCode == DiscordErrorCode.MissingPermissions)
         {
-            await message.Channel.SendMessageAsync(
-                "권한이 부족해서 작업을 진행하지 못했어요.\n" +
-                "봇에 아래 권한을 추가해 주세요.\n" +
-                "- Manage Channels\n" +
-                "- View Channels\n" +
-                "- Send Messages\n" +
-                "- Attach Files\n" +
-                "- Read Message History");
+            await message.Channel.SendMessageAsync(MissingPermissionsMessage);
         }
         catch (Exception exception)
         {
@@ -253,22 +266,13 @@ public sealed class DiscordAgentBot
         }
         catch (HttpException httpException) when (httpException.DiscordCode == DiscordErrorCode.MissingPermissions)
         {
-            string message =
-                "권한이 부족해서 작업을 진행하지 못했어요.\n" +
-                "봇에 아래 권한을 추가해 주세요.\n" +
-                "- Manage Channels\n" +
-                "- View Channels\n" +
-                "- Send Messages\n" +
-                "- Attach Files\n" +
-                "- Read Message History";
-
             if (command.HasResponded)
             {
-                await command.FollowupAsync(message);
+                await command.FollowupAsync(MissingPermissionsMessage);
             }
             else
             {
-                await command.RespondAsync(message);
+                await command.RespondAsync(MissingPermissionsMessage);
             }
         }
         catch (Exception exception)
@@ -336,14 +340,7 @@ public sealed class DiscordAgentBot
 
             if (!HasWorkspacePermissions(guildChannel))
             {
-                await message.Channel.SendMessageAsync(
-                    "이 서버에서 프로젝트 채널을 만들 권한이 부족해요.\n" +
-                    "봇 역할에 아래 권한을 추가해 주세요.\n" +
-                    "- Manage Channels\n" +
-                    "- View Channels\n" +
-                    "- Send Messages\n" +
-                    "- Attach Files\n" +
-                    "- Read Message History");
+                await message.Channel.SendMessageAsync(MissingWorkspacePermissionsMessage);
                 return;
             }
 
@@ -353,15 +350,7 @@ public sealed class DiscordAgentBot
                 (allowFullAccess ? "\n이번 실행은 승인된 full access 모드로 진행합니다." : string.Empty));
 
             OrchestratorRunResult runResult = await RunTaskInGuildAsync(guildChannel.Guild, goal, allowFullAccess);
-            ExecutionReport report = runResult.Report;
-
-            string summary =
-                $"실행 완료\n" +
-                $"- Run Id: `{report.RunId}`\n" +
-                $"- Project: `{report.ProjectName}`\n" +
-                $"- Sub Agents: `{report.SubAgentCount}`\n" +
-                $"- Report: `{Path.GetFileName(runResult.Artifacts.TextReportPath)}`\n" +
-                "- 서버에 프로젝트 워크스페이스 채널을 생성했습니다.";
+            string summary = BuildRunCompletionSummary(runResult);
 
             await using var reportStream = File.OpenRead(runResult.Artifacts.TextReportPath);
             await message.Channel.SendFileAsync(
@@ -408,14 +397,7 @@ public sealed class DiscordAgentBot
 
             if (!HasWorkspacePermissions(guildChannel))
             {
-                await command.FollowupAsync(
-                    "이 서버에서 프로젝트 채널을 만들 권한이 부족해요.\n" +
-                    "봇 역할에 아래 권한을 추가해 주세요.\n" +
-                    "- Manage Channels\n" +
-                    "- View Channels\n" +
-                    "- Send Messages\n" +
-                    "- Attach Files\n" +
-                    "- Read Message History");
+                await command.FollowupAsync(MissingWorkspacePermissionsMessage);
                 return;
             }
 
@@ -424,15 +406,7 @@ public sealed class DiscordAgentBot
                 "프로젝트 카테고리와 `main-codex`, `sub-codex-*` 채널을 만들고 진행 기록을 남길게요.");
 
             OrchestratorRunResult runResult = await RunTaskInGuildAsync(guildChannel.Guild, goal, allowFullAccess: false);
-            ExecutionReport report = runResult.Report;
-
-            string summary =
-                $"실행 완료\n" +
-                $"- Run Id: `{report.RunId}`\n" +
-                $"- Project: `{report.ProjectName}`\n" +
-                $"- Sub Agents: `{report.SubAgentCount}`\n" +
-                $"- Report: `{Path.GetFileName(runResult.Artifacts.TextReportPath)}`\n" +
-                "- 서버에 프로젝트 워크스페이스 채널을 생성했습니다.";
+            string summary = BuildRunCompletionSummary(runResult);
 
             await using var reportStream = File.OpenRead(runResult.Artifacts.TextReportPath);
             await command.FollowupWithFileAsync(
@@ -493,15 +467,11 @@ public sealed class DiscordAgentBot
 
         if (latest is null)
         {
-            await message.Channel.SendMessageAsync("완료된 실행 기록이 아직 없어요.");
+            await message.Channel.SendMessageAsync(NoCompletedRunsMessage);
             return;
         }
 
-        await message.Channel.SendMessageAsync(
-            $"최근 실행:\n" +
-            $"- Run Id: `{latest.RunId}`\n" +
-            $"- Project: `{latest.ProjectName}`\n" +
-            $"- Generated At: `{latest.GeneratedAt:yyyy-MM-dd HH:mm:ss zzz}`");
+        await message.Channel.SendMessageAsync(BuildLatestRunMessage(latest));
     }
 
     private async Task HandleStatusSlashAsync(SocketSlashCommand command)
@@ -510,15 +480,11 @@ public sealed class DiscordAgentBot
 
         if (latest is null)
         {
-            await command.RespondAsync("완료된 실행 기록이 아직 없어요.");
+            await command.RespondAsync(NoCompletedRunsMessage);
             return;
         }
 
-        await command.RespondAsync(
-            $"최근 실행:\n" +
-            $"- Run Id: `{latest.RunId}`\n" +
-            $"- Project: `{latest.ProjectName}`\n" +
-            $"- Generated At: `{latest.GeneratedAt:yyyy-MM-dd HH:mm:ss zzz}`");
+        await command.RespondAsync(BuildLatestRunMessage(latest));
     }
 
     private async Task HandleHistoryAsync(SocketUserMessage message)
@@ -527,16 +493,11 @@ public sealed class DiscordAgentBot
 
         if (history.Count == 0)
         {
-            await message.Channel.SendMessageAsync("완료된 실행 기록이 아직 없어요.");
+            await message.Channel.SendMessageAsync(NoCompletedRunsMessage);
             return;
         }
 
-        string body = string.Join(
-            "\n",
-            history.Take(5).Select(entry =>
-                $"- `{entry.RunId}` | {entry.ProjectName} | {entry.GeneratedAt:MM-dd HH:mm}"));
-
-        await message.Channel.SendMessageAsync($"최근 실행 기록:\n{body}");
+        await message.Channel.SendMessageAsync(BuildHistoryMessage(history));
     }
 
     private async Task HandleHistorySlashAsync(SocketSlashCommand command)
@@ -545,16 +506,11 @@ public sealed class DiscordAgentBot
 
         if (history.Count == 0)
         {
-            await command.RespondAsync("완료된 실행 기록이 아직 없어요.");
+            await command.RespondAsync(NoCompletedRunsMessage);
             return;
         }
 
-        string body = string.Join(
-            "\n",
-            history.Take(5).Select(entry =>
-                $"- `{entry.RunId}` | {entry.ProjectName} | {entry.GeneratedAt:MM-dd HH:mm}"));
-
-        await command.RespondAsync($"최근 실행 기록:\n{body}");
+        await command.RespondAsync(BuildHistoryMessage(history));
     }
 
     private async Task HandleReportAsync(SocketUserMessage message, string runId)
@@ -608,25 +564,13 @@ public sealed class DiscordAgentBot
     private async Task HandleRequestAsync(SocketUserMessage message)
     {
         ProjectRequestLoadResult request = await _runtime.LoadRequestAsync();
-
-        string deliverables = string.Join("\n", request.Request.Deliverables.Select(item => $"- {item}"));
-        await message.Channel.SendMessageAsync(
-            $"현재 요청 파일:\n" +
-            $"- Project: `{request.Request.Name}`\n" +
-            $"- Goal: {request.Request.Goal}\n" +
-            $"Deliverables:\n{deliverables}");
+        await message.Channel.SendMessageAsync(BuildRequestMessage(request));
     }
 
     private async Task HandleRequestSlashAsync(SocketSlashCommand command)
     {
         ProjectRequestLoadResult request = await _runtime.LoadRequestAsync();
-
-        string deliverables = string.Join("\n", request.Request.Deliverables.Select(item => $"- {item}"));
-        await command.RespondAsync(
-            $"현재 요청 파일:\n" +
-            $"- Project: `{request.Request.Name}`\n" +
-            $"- Goal: {request.Request.Goal}\n" +
-            $"Deliverables:\n{deliverables}");
+        await command.RespondAsync(BuildRequestMessage(request));
     }
 
     private string BuildHelpText()
@@ -933,6 +877,49 @@ public sealed class DiscordAgentBot
     private static bool IsApprovalRejected(string normalized)
     {
         return normalized is "취소" or "거절" or "no" or "n" or "ㄴㄴ";
+    }
+
+    private static string BuildRunCompletionSummary(OrchestratorRunResult runResult)
+    {
+        ExecutionReport report = runResult.Report;
+
+        return
+            $"실행 완료\n" +
+            $"- Run Id: `{report.RunId}`\n" +
+            $"- Project: `{report.ProjectName}`\n" +
+            $"- Sub Agents: `{report.SubAgentCount}`\n" +
+            $"- Report: `{Path.GetFileName(runResult.Artifacts.TextReportPath)}`\n" +
+            "- 서버에 프로젝트 워크스페이스 채널을 생성했습니다.";
+    }
+
+    private static string BuildLatestRunMessage(RunHistoryEntry latest)
+    {
+        return
+            $"최근 실행:\n" +
+            $"- Run Id: `{latest.RunId}`\n" +
+            $"- Project: `{latest.ProjectName}`\n" +
+            $"- Generated At: `{latest.GeneratedAt:yyyy-MM-dd HH:mm:ss zzz}`";
+    }
+
+    private static string BuildHistoryMessage(IReadOnlyList<RunHistoryEntry> history)
+    {
+        string body = string.Join(
+            "\n",
+            history.Take(5).Select(entry =>
+                $"- `{entry.RunId}` | {entry.ProjectName} | {entry.GeneratedAt:MM-dd HH:mm}"));
+
+        return $"최근 실행 기록:\n{body}";
+    }
+
+    private static string BuildRequestMessage(ProjectRequestLoadResult request)
+    {
+        string deliverables = string.Join("\n", request.Request.Deliverables.Select(item => $"- {item}"));
+
+        return
+            $"현재 요청 파일:\n" +
+            $"- Project: `{request.Request.Name}`\n" +
+            $"- Goal: {request.Request.Goal}\n" +
+            $"Deliverables:\n{deliverables}";
     }
 
     private Task<OrchestratorRunResult> RunTaskInGuildAsync(SocketGuild guild, string goal, bool allowFullAccess)
