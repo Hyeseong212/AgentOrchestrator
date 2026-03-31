@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using AgentOrchestrator.Models;
 using AgentOrchestrator.Services;
 using Discord;
@@ -34,13 +35,27 @@ public sealed class DiscordAgentBot
         Task
     }
 
-    private sealed record PendingApprovalRequest(ApprovalActionKind ActionKind, string Input);
+    private sealed record AgentChannelRoute(
+        string AgentName,
+        string WorkspaceRoot,
+        string? HostContext,
+        bool RequiresFullAccess);
+    private sealed record PendingApprovalRequest(
+        ApprovalActionKind ActionKind,
+        string Input,
+        AgentChannelRoute? Route = null);
+    private sealed record WorkspaceResolution(
+        string? WorkspaceRoot,
+        string? HostContext,
+        bool UseFullAccess,
+        bool StopProcessing);
 
     private readonly DiscordSocketClient _client;
     private bool _slashCommandsRegistered;
     private readonly string _commandPrefix;
     private readonly AgentOrchestratorRuntime _runtime;
-    private readonly HashSet<string> _approvedAccessRequests = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _activeWorkspaceRoots = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<ulong> _approvedFullAccessUsers = [];
     private readonly Lock _approvalSync = new();
     private readonly Dictionary<string, PendingApprovalRequest> _pendingApprovals = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _runLock = new(1, 1);
@@ -108,7 +123,13 @@ public sealed class DiscordAgentBot
         return Task.CompletedTask;
     }
 
-    private async Task OnMessageReceivedAsync(SocketMessage socketMessage)
+    private Task OnMessageReceivedAsync(SocketMessage socketMessage)
+    {
+        _ = RunGatewayHandlerAsync(() => ProcessMessageReceivedAsync(socketMessage), "MessageReceived");
+        return Task.CompletedTask;
+    }
+
+    private async Task ProcessMessageReceivedAsync(SocketMessage socketMessage)
     {
         if (socketMessage.Author.IsBot || socketMessage is not SocketUserMessage message)
         {
@@ -196,6 +217,18 @@ public sealed class DiscordAgentBot
 
     private async Task HandleConversationalMessageAsync(SocketUserMessage message, string input)
     {
+        if (TryResolveAgentChannelRoute(message, out AgentChannelRoute? route))
+        {
+            bool? routedFullAccess = await ResolveAccessApprovalAsync(message, ApprovalActionKind.Ask, input, route);
+            if (routedFullAccess is null)
+            {
+                return;
+            }
+
+            await HandleAskCoreAsync(message, input, routedFullAccess.Value, route);
+            return;
+        }
+
         bool isTaskRequest = LooksLikeTaskRequest(input);
         bool? allowFullAccess = await ResolveAccessApprovalAsync(
             message,
@@ -226,7 +259,13 @@ public sealed class DiscordAgentBot
         await HandleAskCoreAsync(message, input, allowFullAccess.Value);
     }
 
-    private async Task OnSlashCommandExecutedAsync(SocketSlashCommand command)
+    private Task OnSlashCommandExecutedAsync(SocketSlashCommand command)
+    {
+        _ = RunGatewayHandlerAsync(() => ProcessSlashCommandExecutedAsync(command), "SlashCommandExecuted");
+        return Task.CompletedTask;
+    }
+
+    private async Task ProcessSlashCommandExecutedAsync(SocketSlashCommand command)
     {
         try
         {
@@ -288,6 +327,18 @@ public sealed class DiscordAgentBot
         }
     }
 
+    private async Task RunGatewayHandlerAsync(Func<Task> handler, string handlerName)
+    {
+        try
+        {
+            await handler();
+        }
+        catch (Exception exception)
+        {
+            Console.WriteLine($"[Error] {handlerName} handler failed: {exception}");
+        }
+    }
+
     private async Task HandleTaskAsync(SocketUserMessage message, string goal)
     {
         if (string.IsNullOrWhiteSpace(goal))
@@ -344,12 +395,27 @@ public sealed class DiscordAgentBot
                 return;
             }
 
+            WorkspaceResolution workspace = await ResolveWorkspaceAsync(message, goal, allowFullAccess);
+            if (workspace.StopProcessing)
+            {
+                return;
+            }
+
             await message.Channel.SendMessageAsync(
                 $"작업 실행을 시작합니다: `{goal}`\n" +
-                "프로젝트 카테고리와 `main-codex`, `sub-codex-*` 채널을 만들고 진행 기록을 남길게요." +
-                (allowFullAccess ? "\n이번 실행은 승인된 full access 모드로 진행합니다." : string.Empty));
+                "프로젝트 카테고리와 `main-codex` 채널을 만들고, 일이 커지면 `sub-codex-*` 채널도 추가해서 진행 기록을 남길게요." +
+                (string.IsNullOrWhiteSpace(workspace.WorkspaceRoot)
+                    ? string.Empty
+                    : $"\n작업 기준 폴더: `{workspace.WorkspaceRoot}`") +
+                (workspace.UseFullAccess ? "\n이번 실행은 승인된 full access 모드로 진행합니다." : string.Empty));
 
-            OrchestratorRunResult runResult = await RunTaskInGuildAsync(guildChannel.Guild, goal, allowFullAccess);
+            OrchestratorRunResult runResult = await RunTaskInGuildAsync(
+                guildChannel.Guild,
+                goal,
+                workspace.UseFullAccess,
+                workspace.WorkspaceRoot,
+                workspace.HostContext,
+                message.Author.Id);
             string summary = BuildRunCompletionSummary(runResult);
 
             await using var reportStream = File.OpenRead(runResult.Artifacts.TextReportPath);
@@ -403,9 +469,13 @@ public sealed class DiscordAgentBot
 
             await command.FollowupAsync(
                 $"작업 실행을 시작합니다: `{goal}`\n" +
-                "프로젝트 카테고리와 `main-codex`, `sub-codex-*` 채널을 만들고 진행 기록을 남길게요.");
+                "프로젝트 카테고리와 `main-codex` 채널을 만들고, 일이 커지면 `sub-codex-*` 채널도 추가해서 진행 기록을 남길게요.");
 
-            OrchestratorRunResult runResult = await RunTaskInGuildAsync(guildChannel.Guild, goal, allowFullAccess: false);
+            OrchestratorRunResult runResult = await RunTaskInGuildAsync(
+                guildChannel.Guild,
+                goal,
+                allowFullAccess: false,
+                requesterUserId: command.User.Id);
             string summary = BuildRunCompletionSummary(runResult);
 
             await using var reportStream = File.OpenRead(runResult.Artifacts.TextReportPath);
@@ -428,19 +498,45 @@ public sealed class DiscordAgentBot
             return;
         }
 
-        bool? allowFullAccess = await ResolveAccessApprovalAsync(message, ApprovalActionKind.Ask, question);
+        AgentChannelRoute? route = TryResolveAgentChannelRoute(message, out AgentChannelRoute? resolvedRoute)
+            ? resolvedRoute
+            : null;
+
+        bool? allowFullAccess = await ResolveAccessApprovalAsync(message, ApprovalActionKind.Ask, question, route);
         if (allowFullAccess is null)
         {
             return;
         }
 
-        await HandleAskCoreAsync(message, question, allowFullAccess.Value);
+        await HandleAskCoreAsync(message, question, allowFullAccess.Value, route);
     }
 
-    private async Task HandleAskCoreAsync(SocketUserMessage message, string question, bool allowFullAccess)
+    private async Task HandleAskCoreAsync(
+        SocketUserMessage message,
+        string question,
+        bool allowFullAccess,
+        AgentChannelRoute? route = null)
     {
+        WorkspaceResolution workspace = await ResolveWorkspaceAsync(
+            message,
+            question,
+            allowFullAccess,
+            route?.WorkspaceRoot,
+            route?.HostContext);
+        if (workspace.StopProcessing)
+        {
+            return;
+        }
+
+        await message.Channel.SendMessageAsync(
+            BuildAskStartedMessage(workspace.UseFullAccess, workspace.WorkspaceRoot, route?.AgentName));
         using IDisposable typing = message.Channel.EnterTypingState();
-        CodexTaskResponse answer = await _runtime.AskAsync(question, allowFullAccess);
+        CodexTaskResponse answer = await _runtime.AskAsync(
+            question,
+            workspace.UseFullAccess,
+            workspace.WorkspaceRoot,
+            workspace.HostContext,
+            route?.AgentName);
         await message.Channel.SendMessageAsync(answer.Message);
     }
 
@@ -452,6 +548,7 @@ public sealed class DiscordAgentBot
             return;
         }
 
+        await command.FollowupAsync(BuildAskStartedMessage(allowFullAccess: false, workspaceRoot: null));
         CodexTaskResponse answer = await _runtime.AskAsync(question);
         await command.FollowupAsync(answer.Message);
     }
@@ -578,7 +675,8 @@ public sealed class DiscordAgentBot
         return
             $"Commands:\n" +
             "- 슬래시 커맨드 `/`를 입력하면 Discord 입력창에서 명령 목록이 바로 보여요.\n" +
-            "- `일반/general`, `main-codex`, DM, 또는 봇을 멘션한 메시지에서는 그냥 대화해도 됩니다. 질문이면 답하고, 작업 요청처럼 보이면 자동으로 프로젝트 워크스페이스를 만들고 진행해요.\n" +
+            "- `일반/general`, DM, 또는 봇을 멘션한 메시지에서는 그냥 대화해도 됩니다. 질문이면 답하고, 작업 요청처럼 보이면 자동으로 프로젝트 워크스페이스를 만들고 진행해요.\n" +
+            "- 프로젝트 워크스페이스 안의 `main-codex`, `sub-codex-*` 채널에 바로 말하면 그 채널에 연결된 agent로 자동 라우팅됩니다.\n" +
             $"- `{_commandPrefix}ask <question>`\n" +
             $"- `{_commandPrefix}capabilities`\n" +
             $"- `{_commandPrefix}task <goal>` 프로젝트 카테고리와 main/sub codex 채널 생성\n" +
@@ -594,8 +692,9 @@ public sealed class DiscordAgentBot
     {
         return
             "지금 이 봇은 두 가지를 할 수 있어요.\n" +
-            $"- `{_commandPrefix}task <목표>` 또는 `/task`: 프로젝트 카테고리와 `main-codex`/`sub-codex-*` 채널을 만들고, 목표를 작업으로 분해해서 진행 기록과 report를 남김\n" +
+            $"- `{_commandPrefix}task <목표>` 또는 `/task`: 프로젝트 카테고리와 `main-codex` 채널을 만들고, 일이 커지면 `sub-codex-*`도 추가로 만들어서 진행 기록과 report를 남김\n" +
             $"- `{_commandPrefix}ask <질문>` 또는 `/ask`: 바로 질문에 짧게 답변\n" +
+            "- 만들어진 `main-codex`와 `sub-codex-*` 채널에 바로 말하면 해당 Main/Sub Codex로 자동 라우팅\n" +
             "- 일반 채널에서 그냥 대화해도 돼요. 질문이면 답하고, 작업 요청이면 스스로 작업으로 전환해요.\n" +
             $"- `{_commandPrefix}status`, `{_commandPrefix}history`, `{_commandPrefix}report <runId>`, `{_commandPrefix}request`도 사용할 수 있어요.\n" +
             "- 입력창에서 명령 목록 자동완성을 보려면 `!`가 아니라 `/`를 사용해야 해요.";
@@ -686,6 +785,11 @@ public sealed class DiscordAgentBot
             return true;
         }
 
+        if (TryResolveAgentChannelRoute(message, out _))
+        {
+            return true;
+        }
+
         if (message.Channel is SocketGuildChannel guildChannel)
         {
             if (guildChannel.Name.StartsWith("sub-codex-", StringComparison.OrdinalIgnoreCase))
@@ -723,26 +827,117 @@ public sealed class DiscordAgentBot
             .Trim();
     }
 
-    private async Task<bool?> ResolveAccessApprovalAsync(
-        SocketUserMessage message,
-        ApprovalActionKind actionKind,
-        string input)
+    private bool TryResolveAgentChannelRoute(SocketUserMessage message, out AgentChannelRoute? route)
     {
-        if (!RequiresSensitiveLocalAccess(input))
+        route = null;
+
+        if (message.Channel is not SocketTextChannel textChannel)
         {
             return false;
         }
 
-        string approvalKey = BuildApprovalCacheKey(message.Author.Id, actionKind, input);
+        if (!DiscordProjectWorkspaceObserver.TryParseChannelTopic(
+                textChannel.Topic,
+                out string agentName,
+                out string workspaceRoot))
+        {
+            return false;
+        }
+
+        route = new AgentChannelRoute(
+            agentName,
+            workspaceRoot,
+            BuildAgentChannelHostContext(textChannel, agentName, workspaceRoot),
+            RequiresFullAccessForWorkspace(workspaceRoot));
+        return true;
+    }
+
+    private async Task UpdateAgentChannelWorkspaceTopicsAsync(
+        SocketUserMessage message,
+        string workspaceRoot,
+        CancellationToken cancellationToken = default)
+    {
+        if (message.Channel is not SocketTextChannel currentChannel)
+        {
+            return;
+        }
+
+        IEnumerable<SocketTextChannel> routeChannels = currentChannel.Guild.TextChannels
+            .Where(channel => channel.CategoryId == currentChannel.CategoryId);
+
+        foreach (SocketTextChannel channel in routeChannels)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (!DiscordProjectWorkspaceObserver.TryParseChannelTopic(
+                    channel.Topic,
+                    out string agentName,
+                    out string existingWorkspaceRoot))
+            {
+                continue;
+            }
+
+            if (string.Equals(existingWorkspaceRoot, workspaceRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            string updatedTopic = DiscordProjectWorkspaceObserver.BuildChannelTopic(agentName, workspaceRoot);
+            await channel.ModifyAsync(properties => properties.Topic = updatedTopic);
+        }
+    }
+
+    private static string BuildAgentChannelHostContext(
+        SocketTextChannel guildChannel,
+        string agentName,
+        string workspaceRoot)
+    {
+        string categoryName = guildChannel.Category?.Name ?? "uncategorized";
+        return
+            $"This Discord channel is `{guildChannel.Name}` under category `{categoryName}` and is directly routed to `{agentName}`. " +
+            $"Continue using `{workspaceRoot}` as the project working directory unless the user explicitly switches to a different path.";
+    }
+
+    private bool RequiresFullAccessForWorkspace(string workspaceRoot)
+    {
+        return !IsPathWithinRoot(workspaceRoot, _runtime.WorkspaceRoot);
+    }
+
+    private static bool IsPathWithinRoot(string candidatePath, string rootPath)
+    {
+        string normalizedCandidate = EnsureTrailingSeparator(Path.GetFullPath(candidatePath));
+        string normalizedRoot = EnsureTrailingSeparator(Path.GetFullPath(rootPath));
+        return normalizedCandidate.StartsWith(normalizedRoot, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string EnsureTrailingSeparator(string path)
+    {
+        return path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+    }
+
+    private async Task<bool?> ResolveAccessApprovalAsync(
+        SocketUserMessage message,
+        ApprovalActionKind actionKind,
+        string input,
+        AgentChannelRoute? route = null)
+    {
+        string approvalInput = route is { RequiresFullAccess: true }
+            ? $"{route.WorkspaceRoot}\n{input}"
+            : input;
+
+        if (!RequiresSensitiveLocalAccess(approvalInput))
+        {
+            return false;
+        }
 
         lock (_approvalSync)
         {
-            if (_approvedAccessRequests.Contains(approvalKey))
+            if (_approvedFullAccessUsers.Contains(message.Author.Id))
             {
                 return true;
             }
 
-            _pendingApprovals[BuildPendingApprovalKey(message)] = new PendingApprovalRequest(actionKind, input);
+            _pendingApprovals[BuildPendingApprovalKey(message)] = new PendingApprovalRequest(actionKind, input, route);
         }
 
         await message.Channel.SendMessageAsync(
@@ -774,12 +969,11 @@ public sealed class DiscordAgentBot
             lock (_approvalSync)
             {
                 _pendingApprovals.Remove(BuildPendingApprovalKey(message));
-                _approvedAccessRequests.Add(
-                    BuildApprovalCacheKey(message.Author.Id, pendingRequest.ActionKind, pendingRequest.Input));
+                _approvedFullAccessUsers.Add(message.Author.Id);
             }
 
             await message.Channel.SendMessageAsync(
-                "승인 확인했어요. 같은 요청은 이번 봇 세션에서 다시 묻지 않고 바로 진행할게요.");
+                "승인 확인했어요. 이번 봇 세션에서는 같은 사용자 요청에 다시 묻지 않고 바로 진행할게요.");
             await ExecuteApprovedRequestAsync(message, pendingRequest);
             return true;
         }
@@ -801,10 +995,17 @@ public sealed class DiscordAgentBot
 
     private async Task ExecuteApprovedRequestAsync(SocketUserMessage message, PendingApprovalRequest pendingRequest)
     {
+        AgentChannelRoute? route = pendingRequest.Route;
+
+        if (route is null && TryResolveAgentChannelRoute(message, out AgentChannelRoute? resolvedRoute))
+        {
+            route = resolvedRoute;
+        }
+
         switch (pendingRequest.ActionKind)
         {
             case ApprovalActionKind.Ask:
-                await HandleAskCoreAsync(message, pendingRequest.Input, allowFullAccess: true);
+                await HandleAskCoreAsync(message, pendingRequest.Input, allowFullAccess: true, route);
                 break;
             case ApprovalActionKind.Task:
                 await HandleTaskCoreAsync(message, pendingRequest.Input, allowFullAccess: true);
@@ -830,6 +1031,17 @@ public sealed class DiscordAgentBot
             "로컬",
             "내 컴퓨터",
             "다른 프로젝트",
+            "바깥 폴더",
+            "작업 루트",
+            "워크스페이스",
+            "워크스페이스 변경",
+            "작업 폴더",
+            "외부 폴더",
+            "여기로 이동",
+            "이동",
+            "전환",
+            "바꿔",
+            "열어",
             "workspace 밖",
             "outside workspace",
             "full access",
@@ -837,15 +1049,15 @@ public sealed class DiscordAgentBot
             "folder",
             "directory",
             "path",
+            "workdir",
+            "workspace root",
             "locate",
             "find project",
             "search project"
         ];
 
         return keywords.Any(keyword => normalized.Contains(keyword, StringComparison.OrdinalIgnoreCase)) ||
-               normalized.Contains(":\\", StringComparison.Ordinal) ||
-               normalized.Contains(":/", StringComparison.Ordinal) ||
-               normalized.StartsWith("\\\\", StringComparison.Ordinal);
+               LooksLikeLocalPathReference(input);
     }
 
     private static string BuildPendingApprovalKey(SocketUserMessage message)
@@ -853,9 +1065,240 @@ public sealed class DiscordAgentBot
         return $"{message.Author.Id}:{message.Channel.Id}";
     }
 
-    private static string BuildApprovalCacheKey(ulong userId, ApprovalActionKind actionKind, string input)
+    private async Task<WorkspaceResolution> ResolveWorkspaceAsync(
+        SocketUserMessage message,
+        string input,
+        bool allowFullAccess,
+        string? defaultWorkspaceRoot = null,
+        string? defaultHostContext = null)
     {
-        return $"{userId}:{actionKind}:{NormalizeApprovalDecision(input)}";
+        string conversationKey = BuildPendingApprovalKey(message);
+        string? explicitPath = ExtractLocalPath(input);
+        bool hasApprovedFullAccess;
+        string? activeWorkspaceRoot;
+
+        lock (_approvalSync)
+        {
+            hasApprovedFullAccess = _approvedFullAccessUsers.Contains(message.Author.Id);
+            _activeWorkspaceRoots.TryGetValue(conversationKey, out activeWorkspaceRoot);
+        }
+
+        string? preferredWorkspaceRoot = activeWorkspaceRoot ?? defaultWorkspaceRoot;
+
+        if (!string.IsNullOrWhiteSpace(explicitPath))
+        {
+            string normalizedPath = explicitPath;
+
+            if (Directory.Exists(normalizedPath))
+            {
+                bool changedWorkspace = !string.Equals(preferredWorkspaceRoot, normalizedPath, StringComparison.OrdinalIgnoreCase);
+
+                lock (_approvalSync)
+                {
+                    _activeWorkspaceRoots[conversationKey] = normalizedPath;
+                }
+
+                if (changedWorkspace)
+                {
+                    await UpdateAgentChannelWorkspaceTopicsAsync(message, normalizedPath);
+                    await message.Channel.SendMessageAsync(
+                        $"외부 작업 경로를 확인했어요. 이 채널의 작업 루트를 `{normalizedPath}` 로 전환합니다.");
+                }
+
+                return new WorkspaceResolution(
+                    normalizedPath,
+                    CombineHostContexts(
+                        defaultHostContext,
+                        $"Host verified that the requested local directory exists and set it as the active working directory: {normalizedPath}."),
+                    allowFullAccess || hasApprovedFullAccess,
+                    StopProcessing: false);
+            }
+
+            if (File.Exists(normalizedPath))
+            {
+                string parentDirectory = Path.GetDirectoryName(normalizedPath) ?? normalizedPath;
+                bool changedWorkspace = !string.Equals(preferredWorkspaceRoot, parentDirectory, StringComparison.OrdinalIgnoreCase);
+
+                lock (_approvalSync)
+                {
+                    _activeWorkspaceRoots[conversationKey] = parentDirectory;
+                }
+
+                if (changedWorkspace)
+                {
+                    await UpdateAgentChannelWorkspaceTopicsAsync(message, parentDirectory);
+                    await message.Channel.SendMessageAsync(
+                        $"외부 파일을 확인했어요. 이 채널의 작업 루트를 `{parentDirectory}` 로 전환합니다.");
+                }
+
+                return new WorkspaceResolution(
+                    parentDirectory,
+                    CombineHostContexts(
+                        defaultHostContext,
+                        $"Host verified that the requested local file exists: {normalizedPath}. Use its parent directory as the working directory: {parentDirectory}."),
+                    allowFullAccess || hasApprovedFullAccess,
+                    StopProcessing: false);
+            }
+
+            await message.Channel.SendMessageAsync($"경로를 직접 확인했는데 찾지 못했어요: `{normalizedPath}`");
+            return new WorkspaceResolution(
+                null,
+                CombineHostContexts(
+                    defaultHostContext,
+                    $"Host attempted to resolve the requested local path, but it was not found: {normalizedPath}."),
+                allowFullAccess || hasApprovedFullAccess,
+                StopProcessing: true);
+        }
+
+        if (!string.IsNullOrWhiteSpace(preferredWorkspaceRoot))
+        {
+            return new WorkspaceResolution(
+                preferredWorkspaceRoot,
+                CombineHostContexts(
+                    defaultHostContext,
+                    $"Host is continuing in the active local working directory already selected for this channel: {preferredWorkspaceRoot}."),
+                UseFullAccess: allowFullAccess || hasApprovedFullAccess,
+                StopProcessing: false);
+        }
+
+        return new WorkspaceResolution(
+            null,
+            HostContext: defaultHostContext,
+            UseFullAccess: allowFullAccess,
+            StopProcessing: false);
+    }
+
+    private static string? CombineHostContexts(string? first, string? second)
+    {
+        if (string.IsNullOrWhiteSpace(first))
+        {
+            return string.IsNullOrWhiteSpace(second) ? null : second;
+        }
+
+        if (string.IsNullOrWhiteSpace(second))
+        {
+            return first;
+        }
+
+        return $"{first}\n{second}";
+    }
+
+    private static string? ExtractLocalPath(string input)
+    {
+        foreach (string line in input.ReplaceLineEndings("\n").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            string trimmed = line.Trim().Trim('"', '\'');
+
+            if (TryNormalizeLocalPathCandidate(trimmed, out string normalizedPath) &&
+                !ContainsLikelySentenceSuffix(trimmed))
+            {
+                return normalizedPath;
+            }
+
+            Match lineTokenMatch = Regex.Match(
+                trimmed,
+                @"^(?<path>(?:[A-Za-z]:\\|\\\\|%[A-Za-z0-9_]+%\\|Desktop\\|desktop\\|바탕화면\\|~\\|~/)\S+)",
+                RegexOptions.IgnoreCase);
+            if (lineTokenMatch.Success &&
+                TryNormalizeLocalPathCandidate(lineTokenMatch.Groups["path"].Value, out string tokenNormalizedPath))
+            {
+                return tokenNormalizedPath;
+            }
+        }
+
+        Match quotedMatch = Regex.Match(input, "\"([^\\r\\n\"]+)\"");
+        if (quotedMatch.Success)
+        {
+            if (TryNormalizeLocalPathCandidate(quotedMatch.Groups[1].Value, out string normalizedPath))
+            {
+                return normalizedPath;
+            }
+        }
+
+        Match bareMatch = Regex.Match(input, @"((?:[A-Za-z]:\\|\\\\|%[A-Za-z0-9_]+%\\|Desktop\\|desktop\\|바탕화면\\|~\\|~/)[^\s""']+)");
+        if (bareMatch.Success &&
+            TryNormalizeLocalPathCandidate(bareMatch.Groups[1].Value, out string bareNormalizedPath))
+        {
+            return bareNormalizedPath;
+        }
+
+        return null;
+    }
+
+    private static bool ContainsLikelySentenceSuffix(string value)
+    {
+        return value.Contains(' ') || value.Contains('\t');
+    }
+
+    private static bool LooksLikeLocalPathReference(string input)
+    {
+        return TryNormalizeLocalPathCandidate(input, out _) ||
+               input.ReplaceLineEndings(" ").Contains("\\", StringComparison.Ordinal) &&
+               (
+                   input.Contains("Desktop\\", StringComparison.OrdinalIgnoreCase) ||
+                   input.Contains("바탕화면\\", StringComparison.OrdinalIgnoreCase) ||
+                   input.Contains("%USERPROFILE%\\", StringComparison.OrdinalIgnoreCase) ||
+                   input.Contains("OneDrive\\Desktop\\", StringComparison.OrdinalIgnoreCase)
+               );
+    }
+
+    private static bool TryNormalizeLocalPathCandidate(string candidate, out string normalizedPath)
+    {
+        normalizedPath = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(candidate))
+        {
+            return false;
+        }
+
+        string trimmed = candidate.Trim().Trim('"', '\'');
+        string expanded = Environment.ExpandEnvironmentVariables(trimmed).Replace('/', '\\');
+
+        if (Regex.IsMatch(expanded, @"^[A-Za-z]:\\") || expanded.StartsWith("\\\\", StringComparison.Ordinal))
+        {
+            normalizedPath = Path.GetFullPath(expanded);
+            return true;
+        }
+
+        if (expanded.StartsWith("~\\", StringComparison.Ordinal) || expanded.StartsWith("~/", StringComparison.Ordinal))
+        {
+            string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            normalizedPath = Path.GetFullPath(Path.Combine(userProfile, expanded[2..]));
+            return true;
+        }
+
+        if (TryResolveDesktopRelativePath(expanded, out normalizedPath))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryResolveDesktopRelativePath(string candidate, out string normalizedPath)
+    {
+        normalizedPath = string.Empty;
+        string normalizedCandidate = candidate.Replace('/', '\\').TrimStart('\\');
+        string desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+
+        string[] prefixes =
+        [
+            "desktop\\",
+            "Desktop\\",
+            "바탕화면\\"
+        ];
+
+        foreach (string prefix in prefixes)
+        {
+            if (normalizedCandidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                string relative = normalizedCandidate[prefix.Length..];
+                normalizedPath = Path.GetFullPath(Path.Combine(desktopPath, relative));
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static string NormalizeApprovalDecision(string input)
@@ -877,6 +1320,20 @@ public sealed class DiscordAgentBot
     private static bool IsApprovalRejected(string normalized)
     {
         return normalized is "취소" or "거절" or "no" or "n" or "ㄴㄴ";
+    }
+
+    private static string BuildAskStartedMessage(bool allowFullAccess, string? workspaceRoot, string? agentName = null)
+    {
+        string routeText = string.IsNullOrWhiteSpace(agentName)
+            ? "질문 확인했어요."
+            : $"`{agentName}`로 라우팅했어요.";
+        string workspaceText = string.IsNullOrWhiteSpace(workspaceRoot)
+            ? string.Empty
+            : $" `{workspaceRoot}` 기준으로";
+
+        return allowFullAccess
+            ? $"{routeText}{workspaceText} 승인된 full access로 바로 확인 중입니다."
+            : $"{routeText}{workspaceText} 바로 확인 중입니다.";
     }
 
     private static string BuildRunCompletionSummary(OrchestratorRunResult runResult)
@@ -922,10 +1379,19 @@ public sealed class DiscordAgentBot
             $"Deliverables:\n{deliverables}";
     }
 
-    private Task<OrchestratorRunResult> RunTaskInGuildAsync(SocketGuild guild, string goal, bool allowFullAccess)
+    private Task<OrchestratorRunResult> RunTaskInGuildAsync(
+        SocketGuild guild,
+        string goal,
+        bool allowFullAccess,
+        string? workspaceRootOverride = null,
+        string? hostContext = null,
+        ulong? requesterUserId = null)
     {
-        var observer = new DiscordProjectWorkspaceObserver(guild);
-        return _runtime.RunAdHocAsync(goal, observer, allowFullAccess);
+        string workspaceRoot = string.IsNullOrWhiteSpace(workspaceRootOverride)
+            ? _runtime.WorkspaceRoot
+            : workspaceRootOverride;
+        var observer = new DiscordProjectWorkspaceObserver(guild, workspaceRoot, requesterUserId);
+        return _runtime.RunAdHocAsync(goal, observer, allowFullAccess, workspaceRootOverride, hostContext);
     }
 
     private async Task RegisterSlashCommandsAsync()

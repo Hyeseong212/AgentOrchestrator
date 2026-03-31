@@ -84,7 +84,7 @@ public sealed class ProjectRequestLoader
     private static IReadOnlyList<string> BuildDeliverables(string goal)
     {
         string normalized = goal.ReplaceLineEndings(" ").Trim();
-        string[] separators = [",", ";", " 그리고 ", " and "];
+        string[] separators = [",", ";", " 그리고 ", " 및 ", " and "];
 
         foreach (string separator in separators)
         {
@@ -100,12 +100,6 @@ public sealed class ProjectRequestLoader
             }
         }
 
-        return
-        [
-            normalized,
-            "실행 전략 정리",
-            "결과 검증",
-            "후속 리스크 점검"
-        ];
+        return [normalized];
     }
 }

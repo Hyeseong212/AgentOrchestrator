@@ -29,6 +29,7 @@ public sealed class AgentOrchestratorRuntime
 
     public string ProjectRoot => _projectRoot;
     public string RequestPath => _requestPath;
+    public string WorkspaceRoot => _workspaceRoot;
 
     public async Task<OrchestratorRunResult> RunFromFileAsync(CancellationToken cancellationToken = default)
     {
@@ -42,6 +43,8 @@ public sealed class AgentOrchestratorRuntime
                 : "Loaded project request from the existing JSON file.",
             allowFullAccess: false,
             observer: null,
+            workspaceRootOverride: null,
+            hostContext: null,
             cancellationToken);
     }
 
@@ -55,6 +58,8 @@ public sealed class AgentOrchestratorRuntime
             "Created an ad-hoc project request from interactive input.",
             allowFullAccess: false,
             observer: null,
+            workspaceRootOverride: null,
+            hostContext: null,
             cancellationToken);
     }
 
@@ -62,6 +67,8 @@ public sealed class AgentOrchestratorRuntime
         string goal,
         IExecutionObserver observer,
         bool allowFullAccess = false,
+        string? workspaceRootOverride = null,
+        string? hostContext = null,
         CancellationToken cancellationToken = default)
     {
         ProjectRequest request = _requestLoader.CreateAdHocRequest(goal);
@@ -72,6 +79,8 @@ public sealed class AgentOrchestratorRuntime
             "Created an ad-hoc project request from interactive input.",
             allowFullAccess,
             observer,
+            workspaceRootOverride,
+            hostContext,
             cancellationToken);
     }
 
@@ -88,6 +97,9 @@ public sealed class AgentOrchestratorRuntime
     public Task<CodexTaskResponse> AskAsync(
         string question,
         bool allowFullAccess = false,
+        string? workspaceRootOverride = null,
+        string? hostContext = null,
+        string? agentName = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(question))
@@ -95,8 +107,10 @@ public sealed class AgentOrchestratorRuntime
             throw new InvalidOperationException("A question is required.");
         }
 
-        string prompt = BuildQuestionPrompt(question, allowFullAccess);
-        return CreateCodexCliRunner(allowFullAccess).ExecutePromptAsync(prompt, cancellationToken);
+        string activeWorkspaceRoot = workspaceRootOverride ?? _workspaceRoot;
+        string prompt = BuildQuestionPrompt(question, allowFullAccess, activeWorkspaceRoot, hostContext, agentName);
+        return CreateCodexCliRunner(allowFullAccess, workspaceRootOverride, hostContext)
+            .ExecutePromptAsync(prompt, cancellationToken);
     }
 
     private async Task<OrchestratorRunResult> ExecuteRequestAsync(
@@ -105,9 +119,11 @@ public sealed class AgentOrchestratorRuntime
         string requestSourceMessage,
         bool allowFullAccess,
         IExecutionObserver? observer,
+        string? workspaceRootOverride,
+        string? hostContext,
         CancellationToken cancellationToken)
     {
-        MainAgent mainAgent = CreateMainAgent(allowFullAccess);
+        MainAgent mainAgent = CreateMainAgent(allowFullAccess, workspaceRootOverride, hostContext);
         ExecutionReport report = await mainAgent.RunProjectAsync(request, observer, cancellationToken);
         RunArtifacts artifacts = await _artifactsWriter.WriteAsync(_projectRoot, report, cancellationToken);
 
@@ -121,35 +137,54 @@ public sealed class AgentOrchestratorRuntime
         return runResult;
     }
 
-    private MainAgent CreateMainAgent(bool allowFullAccess)
+    private MainAgent CreateMainAgent(bool allowFullAccess, string? workspaceRootOverride = null, string? hostContext = null)
     {
         var planner = new TaskPlanner();
         var scaler = new AgentScaler(minAgents: 1, maxAgents: 6, tasksPerAgent: 2);
-        var runner = CreateCodexCliRunner(allowFullAccess);
+        var runner = CreateCodexCliRunner(allowFullAccess, workspaceRootOverride, hostContext);
         var subAgentFactory = new SubAgentFactory(maxRetries: 2, codexCliRunner: runner);
         var manager = new AgentManager(planner, scaler, subAgentFactory);
 
         return new MainAgent(manager);
     }
 
-    private CodexCliRunner CreateCodexCliRunner(bool allowFullAccess)
+    private CodexCliRunner CreateCodexCliRunner(
+        bool allowFullAccess,
+        string? workspaceRootOverride = null,
+        string? hostContext = null)
     {
-        return new CodexCliRunner(_codexExecutablePath, _workspaceRoot, allowFullAccess);
+        return new CodexCliRunner(
+            _codexExecutablePath,
+            workspaceRootOverride ?? _workspaceRoot,
+            allowFullAccess,
+            hostContext);
     }
 
-    private static string BuildQuestionPrompt(string question, bool allowFullAccess)
+    private static string BuildQuestionPrompt(
+        string question,
+        bool allowFullAccess,
+        string activeWorkspaceRoot,
+        string? hostContext,
+        string? agentName)
     {
         string accessGuidance = allowFullAccess
-            ? "You may inspect local files and folders on this machine, including paths outside the current workspace, when that helps answer the question. Do not claim local access is blocked unless a command actually fails."
+            ? "The user has already approved full local access for this conversation. You may inspect local files and folders on this machine, including paths outside the current workspace, when that helps answer the question. Attempt the local inspection yourself before asking the user to paste directory listings. If a path cannot be accessed, explain the concrete reason such as path not found, command failure, or permission denied. Never claim environment policy blocked local access while full access is enabled."
             : "You are currently operating within the active workspace. If broader local file or folder access would help, explain that user approval is needed before searching outside the workspace.";
 
+        string personaGuidance = string.IsNullOrWhiteSpace(agentName)
+            ? "You are the Codex Agent Orchestration Discord bot. Answer the user's question concisely in Korean. If they ask what you can do, explain the available bot commands and the difference between task execution and direct Q&A. "
+            : string.Equals(agentName, "main-codex", StringComparison.OrdinalIgnoreCase)
+                ? "You are Main Codex, the lead coordinator for this Discord project workspace. Treat the user's latest message as something addressed directly to Main Codex and answer concisely in Korean. "
+                : $"You are {agentName}, a focused sub-agent inside a larger orchestration system. Treat the user's latest message as something addressed directly to you in this Discord channel and answer concisely in Korean. ";
+
         return
-            "You are the Codex Agent Orchestration Discord bot. " +
-            "Answer the user's question concisely in Korean. " +
-            "If they ask what you can do, explain the available bot commands and the difference between task execution and direct Q&A. " +
+            personaGuidance +
             "Keep the answer practical and short. " +
+            "The machine is Windows-first. When referring to local inspection, prefer cmd-compatible commands such as dir, type, where, tree /f, and if exist, or explicitly use powershell -NoProfile -Command for PowerShell cmdlets. Never describe cmd.exe /c Get-ChildItem as a valid command because Get-ChildItem is not a cmd built-in. " +
+            $"The active working directory for this request is `{activeWorkspaceRoot}`. " +
             accessGuidance +
+            (string.IsNullOrWhiteSpace(hostContext) ? string.Empty : $"\nHost context: {hostContext}") +
             "\n\n" +
-            $"User question: {question.Trim()}";
+            $"User message: {question.Trim()}";
     }
 }

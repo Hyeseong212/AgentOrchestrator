@@ -23,12 +23,16 @@ public sealed class ExecutionReport
         builder.AppendLine($"Goal: {Goal}");
         builder.AppendLine($"Generated At: {GeneratedAt:yyyy-MM-dd HH:mm:ss zzz}");
         builder.AppendLine($"Scaled Sub Agents: {SubAgentCount}");
+        builder.AppendLine($"Estimated Difficulty: {GetOverallDifficulty()}");
+        builder.AppendLine($"Estimated Duration: ~{PlannedTasks.Sum(task => task.EstimatedMinutes)} min");
         builder.AppendLine();
         builder.AppendLine("Planned Tasks");
 
         foreach (AgentTask task in PlannedTasks)
         {
-            builder.AppendLine($"- [{task.Priority}] #{task.Id} {task.Title}");
+            builder.AppendLine(
+                $"- [{task.Priority}] #{task.Id} {task.Title} | " +
+                $"Lane: {task.ExecutionLaneLabel} | Phase: {task.Phase} | ETA: ~{task.EstimatedMinutes} min");
             builder.AppendLine($"  {task.Description}");
         }
 
@@ -68,5 +72,11 @@ public sealed class ExecutionReport
         }
 
         return builder.ToString();
+    }
+
+    private string GetOverallDifficulty()
+    {
+        int maxComplexity = PlannedTasks.Count == 0 ? 1 : PlannedTasks.Max(task => task.Complexity);
+        return maxComplexity >= 4 ? "High" : maxComplexity == 3 ? "Medium" : "Low";
     }
 }

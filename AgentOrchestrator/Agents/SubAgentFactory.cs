@@ -19,4 +19,9 @@ public sealed class SubAgentFactory
             .Select(index => new SubAgent($"sub-agent-{index}", _maxRetries, _codexCliRunner))
             .ToArray();
     }
+
+    public SubAgent CreateAgent(string name)
+    {
+        return new SubAgent(name, _maxRetries, _codexCliRunner);
+    }
 }

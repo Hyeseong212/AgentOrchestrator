@@ -163,6 +163,15 @@ public sealed class InteractiveAgentHost
             Console.WriteLine(runResult.RequestSourceMessage);
             Console.WriteLine($"Saved Text Report: {artifacts.TextReportPath}");
             Console.WriteLine($"Saved Json Report: {artifacts.JsonReportPath}");
+            Console.WriteLine($"Saved Main Log: {artifacts.MainLogPath}");
+            if (artifacts.SubLogPaths.Count > 0)
+            {
+                Console.WriteLine("Saved Sub Logs:");
+                foreach ((string agentName, string logPath) in artifacts.SubLogPaths.OrderBy(item => item.Key, StringComparer.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine($"  - {agentName}: {logPath}");
+                }
+            }
             Console.WriteLine();
         }
         catch (Exception exception)

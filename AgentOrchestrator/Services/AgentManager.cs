@@ -24,9 +24,12 @@ public sealed class AgentManager
         DateTimeOffset generatedAt = DateTimeOffset.Now;
         var history = new ExecutionHistory();
         IReadOnlyList<AgentTask> tasks = _planner.BuildPlan(request);
-        int subAgentCount = _scaler.DetermineAgentCount(tasks.Count);
-        IReadOnlyList<SubAgent> subAgents = _subAgentFactory.CreateAgents(subAgentCount);
-        var queue = new TaskQueue(tasks);
+        SubAgent mainAgent = _subAgentFactory.CreateAgent("main-codex");
+        int subTaskCount = tasks.Count(task => string.Equals(task.ExecutionLane, "sub", StringComparison.OrdinalIgnoreCase));
+        int subAgentCount = subTaskCount == 0 ? 0 : _scaler.DetermineAgentCount(subTaskCount);
+        IReadOnlyList<SubAgent> subAgents = subAgentCount == 0
+            ? []
+            : _subAgentFactory.CreateAgents(subAgentCount);
         var results = new List<TaskResult>();
         var sync = new Lock();
 
@@ -35,11 +38,38 @@ public sealed class AgentManager
             await observer.OnRunStartedAsync(request, tasks, subAgentCount, cancellationToken);
         }
 
-        Task[] workers = subAgents
-            .Select(agent => RunWorkerAsync(agent, queue, results, history, sync, observer, cancellationToken))
-            .ToArray();
+        foreach (IGrouping<int, AgentTask> phaseGroup in tasks
+                     .OrderBy(task => task.Phase)
+                     .GroupBy(task => task.Phase))
+        {
+            AgentTask[] mainPhaseTasks = phaseGroup
+                .Where(task => string.Equals(task.ExecutionLane, "main", StringComparison.OrdinalIgnoreCase))
+                .OrderBy(task => task.Id)
+                .ToArray();
+            AgentTask[] subPhaseTasks = phaseGroup
+                .Where(task => string.Equals(task.ExecutionLane, "sub", StringComparison.OrdinalIgnoreCase))
+                .OrderBy(task => task.Id)
+                .ToArray();
 
-        await Task.WhenAll(workers);
+            foreach (AgentTask task in mainPhaseTasks)
+            {
+                TaskResult result = await ExecuteTaskWithRetryAsync(mainAgent, task, history, observer, cancellationToken);
+                lock (sync)
+                {
+                    results.Add(result);
+                }
+            }
+
+            if (subPhaseTasks.Length > 0)
+            {
+                var queue = new TaskQueue(subPhaseTasks);
+                Task[] workers = subAgents
+                    .Select(agent => RunWorkerAsync(agent, queue, results, history, sync, observer, cancellationToken))
+                    .ToArray();
+
+                await Task.WhenAll(workers);
+            }
+        }
 
         return new ExecutionReport
         {
@@ -76,9 +106,27 @@ public sealed class AgentManager
                 break;
             }
 
-            queueItem.IncrementAttempt();
-            int attempt = queueItem.AttemptCount;
-            AgentTask task = queueItem.Task;
+            TaskResult result = await ExecuteTaskWithRetryAsync(agent, queueItem.Task, history, observer, cancellationToken);
+
+            lock (sync)
+            {
+                results.Add(result);
+            }
+        }
+    }
+
+    private static async Task<TaskResult> ExecuteTaskWithRetryAsync(
+        SubAgent agent,
+        AgentTask task,
+        ExecutionHistory history,
+        IExecutionObserver? observer,
+        CancellationToken cancellationToken)
+    {
+        int attempt = 0;
+
+        while (true)
+        {
+            attempt++;
 
             TaskExecutionEvent startedEvent = history.Record(
                 task.Id,
@@ -104,7 +152,6 @@ public sealed class AgentManager
                     await observer.OnExecutionEventAsync(retryEvent, cancellationToken);
                 }
 
-                queue.Requeue(queueItem);
                 continue;
             }
 
@@ -121,10 +168,7 @@ public sealed class AgentManager
                 await observer.OnExecutionEventAsync(completedEvent, cancellationToken);
             }
 
-            lock (sync)
-            {
-                results.Add(result);
-            }
+            return result;
         }
     }
 }

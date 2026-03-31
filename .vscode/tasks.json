@@ -7,7 +7,7 @@
       "command": "cmd",
       "args": [
         "/c",
-        "taskkill /IM vsdbg.exe /F /T >nul 2>nul & taskkill /IM AgentOrchestrator.DiscordBot.exe /F /T >nul 2>nul & exit /b 0"
+        "taskkill /IM vsdbg.exe /F /T >nul 2>nul & taskkill /IM AgentOrchestrator.DiscordBot.exe /F /T >nul 2>nul & taskkill /IM AgentOrchestrator.exe /F /T >nul 2>nul & exit /b 0"
       ],
       "problemMatcher": []
     },

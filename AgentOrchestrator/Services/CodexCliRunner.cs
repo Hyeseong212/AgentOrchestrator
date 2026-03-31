@@ -10,13 +10,19 @@ public sealed class CodexCliRunner
     private static readonly UTF8Encoding Utf8WithoutBom = new(encoderShouldEmitUTF8Identifier: false);
     private readonly bool _allowFullAccess;
     private readonly string _codexExecutablePath;
+    private readonly string? _hostContext;
     private readonly string _workspaceRoot;
 
-    public CodexCliRunner(string codexExecutablePath, string workspaceRoot, bool allowFullAccess = false)
+    public CodexCliRunner(
+        string codexExecutablePath,
+        string workspaceRoot,
+        bool allowFullAccess = false,
+        string? hostContext = null)
     {
         _codexExecutablePath = codexExecutablePath;
         _workspaceRoot = workspaceRoot;
         _allowFullAccess = allowFullAccess;
+        _hostContext = hostContext;
     }
 
     public async Task<CodexTaskResponse> ExecuteTaskAsync(
@@ -53,10 +59,10 @@ public sealed class CodexCliRunner
 
             if (_allowFullAccess)
             {
-                processStartInfo.ArgumentList.Add("-a");
-                processStartInfo.ArgumentList.Add("never");
-                processStartInfo.ArgumentList.Add("-s");
-                processStartInfo.ArgumentList.Add("danger-full-access");
+                // In non-interactive exec mode, -a never/-s danger-full-access can still leave
+                // shell commands blocked by policy. The explicit bypass flag is what actually
+                // enables remote local inspection after the Discord user has approved full access.
+                processStartInfo.ArgumentList.Add("--dangerously-bypass-approvals-and-sandbox");
             }
 
             processStartInfo.ArgumentList.Add("exec");
@@ -261,7 +267,7 @@ public sealed class CodexCliRunner
         return 0;
     }
 
-    private static string BuildTaskPrompt(string agentName, AgentTask task, int attempt)
+    private string BuildTaskPrompt(string agentName, AgentTask task, int attempt)
     {
         var builder = new StringBuilder();
         builder.AppendLine($"You are {agentName}, a focused sub-agent inside a larger orchestration system.");
@@ -269,10 +275,23 @@ public sealed class CodexCliRunner
         builder.AppendLine("Return a concise implementation summary for the assigned task.");
         builder.AppendLine("Do not mention that you are an AI model.");
         builder.AppendLine("Use plain text only, 4 sentences max.");
+        builder.AppendLine("The machine is Windows-first. Prefer cmd-compatible commands such as dir, type, where, tree /f, and if exist, or explicitly use powershell -NoProfile -Command for PowerShell cmdlets. Never treat cmd.exe /c Get-ChildItem as a valid command.");
+        builder.AppendLine($"Working directory: {_workspaceRoot}");
+        if (!string.IsNullOrWhiteSpace(_hostContext))
+        {
+            builder.AppendLine($"Host context: {_hostContext}");
+        }
+        if (_allowFullAccess)
+        {
+            builder.AppendLine("Full local access has already been approved for this run. You may inspect local files and folders outside the current workspace when needed. Attempt the inspection yourself before asking the user to paste listings, and do not claim policy blocked access unless a command actually fails.");
+        }
         builder.AppendLine();
         builder.AppendLine($"Task Id: {task.Id}");
         builder.AppendLine($"Task Title: {task.Title}");
         builder.AppendLine($"Task Priority: {task.Priority}");
+        builder.AppendLine($"Task Lane: {task.ExecutionLaneLabel}");
+        builder.AppendLine($"Task Phase: {task.Phase}");
+        builder.AppendLine($"Estimated Minutes: {task.EstimatedMinutes}");
         builder.AppendLine($"Attempt: {attempt}");
         builder.AppendLine($"Task Description: {task.Description}");
         builder.AppendLine();
