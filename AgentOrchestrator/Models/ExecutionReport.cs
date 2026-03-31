@@ -4,11 +4,13 @@ namespace AgentOrchestrator.Models;
 
 public sealed class ExecutionReport
 {
+    public required string RunId { get; init; }
     public required string ProjectName { get; init; }
     public required string Goal { get; init; }
     public required int SubAgentCount { get; init; }
     public required IReadOnlyList<AgentTask> PlannedTasks { get; init; }
     public required IReadOnlyList<TaskResult> Results { get; init; }
+    public required IReadOnlyList<TaskExecutionEvent> ExecutionTimeline { get; init; }
     public required IReadOnlyList<string> NextSteps { get; init; }
     public required DateTimeOffset GeneratedAt { get; init; }
 
@@ -16,6 +18,7 @@ public sealed class ExecutionReport
     {
         var builder = new StringBuilder();
 
+        builder.AppendLine($"Run Id: {RunId}");
         builder.AppendLine($"Project: {ProjectName}");
         builder.AppendLine($"Goal: {Goal}");
         builder.AppendLine($"Generated At: {GeneratedAt:yyyy-MM-dd HH:mm:ss zzz}");
@@ -37,8 +40,23 @@ public sealed class ExecutionReport
             builder.AppendLine($"- #{result.TaskId} {result.TaskTitle}");
             builder.AppendLine($"  Agent: {result.AssignedAgent}");
             builder.AppendLine($"  Status: {result.Status}");
+            builder.AppendLine($"  Attempts: {result.Attempts}");
+            builder.AppendLine($"  Mode: {result.ExecutionMode}");
+            builder.AppendLine($"  Model: {result.Model ?? "n/a"}");
+            builder.AppendLine($"  Tokens: {result.TokensUsed?.ToString("N0") ?? "n/a"}");
             builder.AppendLine($"  Duration: {result.Duration.TotalMilliseconds:N0} ms");
             builder.AppendLine($"  Summary: {result.Summary}");
+        }
+
+        builder.AppendLine();
+        builder.AppendLine("Execution Timeline");
+
+        foreach (TaskExecutionEvent executionEvent in ExecutionTimeline.OrderBy(item => item.Timestamp))
+        {
+            builder.AppendLine(
+                $"- {executionEvent.Timestamp:HH:mm:ss.fff} | Task #{executionEvent.TaskId} | " +
+                $"{executionEvent.AgentName} | {executionEvent.State} | Attempt {executionEvent.Attempt}");
+            builder.AppendLine($"  {executionEvent.Message}");
         }
 
         builder.AppendLine();

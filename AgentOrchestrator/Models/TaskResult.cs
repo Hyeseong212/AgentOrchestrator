@@ -6,4 +6,8 @@ public sealed record TaskResult(
     string AssignedAgent,
     string Status,
     string Summary,
+    int Attempts,
+    string ExecutionMode,
+    string? Model,
+    int? TokensUsed,
     TimeSpan Duration);

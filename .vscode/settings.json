@@ -1,0 +1,17 @@
+{
+  "dotnetAcquisitionExtension.sharedExistingDotnetPath": "C:\\Program Files\\dotnet",
+  "dotnetAcquisitionExtension.existingDotnetPath": [
+    {
+      "extensionId": "ms-dotnettools.csharp",
+      "path": "C:\\Program Files\\dotnet"
+    },
+    {
+      "extensionId": "ms-dotnettools.csdevkit",
+      "path": "C:\\Program Files\\dotnet"
+    }
+  ],
+  "dotnet.toolingRuntimePath": "C:\\Program Files\\dotnet\\dotnet.exe",
+  "omnisharp.dotnetPath": "C:\\Program Files\\dotnet",
+  "dotnet.server.useOmnisharp": false,
+  "dotnet.preferCSharpExtension": true
+}

@@ -1,0 +1,65 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "stop-agent-orchestrator-discord-bot",
+      "type": "process",
+      "command": "cmd",
+      "args": [
+        "/c",
+        "taskkill /IM vsdbg.exe /F /T >nul 2>nul & taskkill /IM AgentOrchestrator.DiscordBot.exe /F /T >nul 2>nul & exit /b 0"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "build-agent-orchestrator",
+      "type": "process",
+      "command": "dotnet",
+      "args": [
+        "build",
+        "${workspaceFolder}/AgentOrchestrator/AgentOrchestrator.csproj",
+        "/p:UseSharedCompilation=false"
+      ],
+      "problemMatcher": "$msCompile",
+      "group": "build"
+    },
+    {
+      "label": "run-agent-orchestrator",
+      "type": "process",
+      "command": "dotnet",
+      "args": [
+        "run",
+        "--project",
+        "${workspaceFolder}/AgentOrchestrator/AgentOrchestrator.csproj"
+      ],
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "build-agent-orchestrator-discord-bot",
+      "dependsOn": [
+        "stop-agent-orchestrator-discord-bot"
+      ],
+      "dependsOrder": "sequence",
+      "type": "process",
+      "command": "dotnet",
+      "args": [
+        "build",
+        "${workspaceFolder}/AgentOrchestrator.DiscordBot/AgentOrchestrator.DiscordBot.csproj",
+        "/p:UseSharedCompilation=false"
+      ],
+      "problemMatcher": "$msCompile",
+      "group": "build"
+    },
+    {
+      "label": "run-agent-orchestrator-discord-bot",
+      "type": "process",
+      "command": "dotnet",
+      "args": [
+        "run",
+        "--project",
+        "${workspaceFolder}/AgentOrchestrator.DiscordBot/AgentOrchestrator.DiscordBot.csproj"
+      ],
+      "problemMatcher": "$msCompile"
+    }
+  ]
+}

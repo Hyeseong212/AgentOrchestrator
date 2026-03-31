@@ -1,0 +1,16 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Launch Discord Bot",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build-agent-orchestrator-discord-bot",
+      "program": "${workspaceFolder}/AgentOrchestrator.DiscordBot/bin/Debug/net10.0/AgentOrchestrator.DiscordBot.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}/AgentOrchestrator.DiscordBot",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    }
+  ]
+}

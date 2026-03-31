@@ -16,32 +16,115 @@ public sealed class AgentManager
         _subAgentFactory = subAgentFactory;
     }
 
-    public async Task<ExecutionReport> ExecuteAsync(ProjectRequest request, CancellationToken cancellationToken)
+    public async Task<ExecutionReport> ExecuteAsync(
+        ProjectRequest request,
+        IExecutionObserver? observer,
+        CancellationToken cancellationToken)
     {
+        DateTimeOffset generatedAt = DateTimeOffset.Now;
+        var history = new ExecutionHistory();
         IReadOnlyList<AgentTask> tasks = _planner.BuildPlan(request);
         int subAgentCount = _scaler.DetermineAgentCount(tasks.Count);
         IReadOnlyList<SubAgent> subAgents = _subAgentFactory.CreateAgents(subAgentCount);
+        var queue = new TaskQueue(tasks);
+        var results = new List<TaskResult>();
+        var sync = new Lock();
 
-        var executions = tasks
-            .Select((task, index) => subAgents[index % subAgents.Count].ExecuteAsync(task, cancellationToken))
+        if (observer is not null)
+        {
+            await observer.OnRunStartedAsync(request, tasks, subAgentCount, cancellationToken);
+        }
+
+        Task[] workers = subAgents
+            .Select(agent => RunWorkerAsync(agent, queue, results, history, sync, observer, cancellationToken))
             .ToArray();
 
-        TaskResult[] results = await Task.WhenAll(executions);
+        await Task.WhenAll(workers);
 
         return new ExecutionReport
         {
+            RunId = $"{generatedAt:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}"[..24],
             ProjectName = request.Name,
             Goal = request.Goal,
             SubAgentCount = subAgentCount,
             PlannedTasks = tasks,
-            Results = results,
+            Results = results.OrderBy(item => item.TaskId).ToArray(),
+            ExecutionTimeline = history.Snapshot(),
             NextSteps =
             [
-                "LLM API를 연결해 SubAgent가 실제 추론 결과를 생성하도록 확장한다.",
-                "TaskQueue를 영속화해 실패 작업 재시도와 실행 이력을 남긴다.",
-                "MainAgent에 우선순위 재조정과 의존성 기반 스케줄링을 추가한다."
+                "LLM API를 연결해 SubAgent가 실제 추론 결과와 근거를 생성하도록 확장한다.",
+                "TaskQueue를 파일 또는 DB로 영속화해 중단 후에도 복구 가능하게 만든다.",
+                "MainAgent에 작업 의존성 그래프와 우선순위 재계산 로직을 추가한다."
             ],
-            GeneratedAt = DateTimeOffset.Now
+            GeneratedAt = generatedAt
         };
+    }
+
+    private async Task RunWorkerAsync(
+        SubAgent agent,
+        TaskQueue queue,
+        List<TaskResult> results,
+        ExecutionHistory history,
+        Lock sync,
+        IExecutionObserver? observer,
+        CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            if (!queue.TryDequeue(out TaskQueueItem? queueItem) || queueItem is null)
+            {
+                break;
+            }
+
+            queueItem.IncrementAttempt();
+            int attempt = queueItem.AttemptCount;
+            AgentTask task = queueItem.Task;
+
+            TaskExecutionEvent startedEvent = history.Record(
+                task.Id,
+                agent.Name,
+                "Started",
+                attempt,
+                $"{task.Title} execution started.");
+            if (observer is not null)
+            {
+                await observer.OnExecutionEventAsync(startedEvent, cancellationToken);
+            }
+
+            if (agent.ShouldRetry(task, attempt))
+            {
+                TaskExecutionEvent retryEvent = history.Record(
+                    task.Id,
+                    agent.Name,
+                    "RetryScheduled",
+                    attempt,
+                    "A transient issue was detected. The task was placed back into the queue.");
+                if (observer is not null)
+                {
+                    await observer.OnExecutionEventAsync(retryEvent, cancellationToken);
+                }
+
+                queue.Requeue(queueItem);
+                continue;
+            }
+
+            TaskResult result = await agent.ExecuteAsync(task, attempt, cancellationToken);
+
+            TaskExecutionEvent completedEvent = history.Record(
+                task.Id,
+                agent.Name,
+                result.Status,
+                attempt,
+                result.Summary);
+            if (observer is not null)
+            {
+                await observer.OnExecutionEventAsync(completedEvent, cancellationToken);
+            }
+
+            lock (sync)
+            {
+                results.Add(result);
+            }
+        }
     }
 }

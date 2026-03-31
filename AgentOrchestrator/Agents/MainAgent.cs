@@ -12,8 +12,11 @@ public sealed class MainAgent
         _manager = manager;
     }
 
-    public Task<ExecutionReport> RunProjectAsync(ProjectRequest request, CancellationToken cancellationToken = default)
+    public Task<ExecutionReport> RunProjectAsync(
+        ProjectRequest request,
+        IExecutionObserver? observer = null,
+        CancellationToken cancellationToken = default)
     {
-        return _manager.ExecuteAsync(request, cancellationToken);
+        return _manager.ExecuteAsync(request, observer, cancellationToken);
     }
 }
