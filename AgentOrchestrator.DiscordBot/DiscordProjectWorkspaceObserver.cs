@@ -8,12 +8,17 @@ namespace AgentOrchestrator.DiscordBot;
 
 public sealed class DiscordProjectWorkspaceObserver : IExecutionObserver
 {
+    public sealed record WorkspaceRouteInfo(ulong CategoryId, ulong MainChannelId, string WorkspaceName);
+
     private const string RouteTopicMarker = "codex-route";
     private readonly Dictionary<string, ITextChannel> _agentChannels = new(StringComparer.OrdinalIgnoreCase);
     private readonly SocketGuild _guild;
     private readonly ulong? _requesterUserId;
     private readonly SemaphoreSlim _sync = new(1, 1);
+    private readonly TaskCompletionSource<WorkspaceRouteInfo> _workspaceReady =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly string _workspaceRoot;
+    private ICategoryChannel? _category;
     private ITextChannel? _mainChannel;
     private string? _workspaceName;
 
@@ -37,61 +42,57 @@ public sealed class DiscordProjectWorkspaceObserver : IExecutionObserver
             string categoryName = BuildUniqueCategoryName(request.Name);
             _workspaceName = categoryName;
 
-            ICategoryChannel category = await _guild.CreateCategoryChannelAsync(categoryName);
+            _category = await _guild.CreateCategoryChannelAsync(categoryName);
             _mainChannel = await _guild.CreateTextChannelAsync(
                 "main-codex",
                 properties =>
                 {
-                    properties.CategoryId = category.Id;
+                    properties.CategoryId = _category.Id;
                     properties.Topic = BuildChannelTopic("main-codex", _workspaceRoot);
                 });
 
-            for (int index = 1; index <= subAgentCount; index++)
-            {
-                string agentName = $"sub-agent-{index}";
-                ITextChannel subChannel = await _guild.CreateTextChannelAsync(
-                    $"sub-codex-{index}",
-                    properties =>
-                    {
-                        properties.CategoryId = category.Id;
-                        properties.Topic = BuildChannelTopic(agentName, _workspaceRoot);
-                    });
-                _agentChannels[agentName] = subChannel;
-
-                await subChannel.SendMessageAsync(
-                    $"`sub-codex-{index}` 준비 완료\n연결된 에이전트 ID: `{agentName}`\n이 채널에 바로 말하면 자동으로 이 서브 에이전트에게 라우팅됩니다.");
-            }
+            await SyncSubAgentChannelsAsync(subAgentCount);
+            _workspaceReady.TrySetResult(new WorkspaceRouteInfo(_category.Id, _mainChannel.Id, categoryName));
 
             if (_mainChannel is not null)
             {
-                var builder = new StringBuilder();
-                int estimatedMinutes = plannedTasks.Sum(task => task.EstimatedMinutes);
-                int maxComplexity = plannedTasks.Count == 0 ? 1 : plannedTasks.Max(task => task.Complexity);
-                builder.AppendLine($"Main Codex가 프로젝트를 시작했습니다: `{request.Name}`");
-                builder.AppendLine($"목표: {request.Goal}");
-                builder.AppendLine($"예상 난이도: `{TranslatePriority(maxComplexity)}`");
-                builder.AppendLine($"예상 소요: `약 {estimatedMinutes}분`");
-                if (subAgentCount == 0)
-                {
-                    builder.AppendLine("이번 작업은 Main Codex가 단독으로 처리합니다.");
-                }
-                else
-                {
-                    builder.AppendLine($"Sub Codex 수: `{subAgentCount}`");
-                    builder.AppendLine("Main Codex가 분석/통합 단계를 맡고, Sub Codex가 병렬 가능한 구현 단계를 맡습니다.");
-                }
-                builder.AppendLine("이 채널에 바로 말하면 Main Codex에게 자동으로 라우팅됩니다.");
-                builder.AppendLine("계획된 작업:");
-
-                foreach (AgentTask task in plannedTasks)
-                {
-                    builder.AppendLine(
-                        $"- #{task.Id} {task.Title} [{task.Priority}] | " +
-                        $"{task.ExecutionLaneLabel} | phase {task.Phase} | 약 {task.EstimatedMinutes}분");
-                }
-
-                await _mainChannel.SendMessageAsync(builder.ToString());
+                await _mainChannel.SendMessageAsync(BuildPlanAnnouncement(
+                    request,
+                    plannedTasks,
+                    subAgentCount,
+                    heading: $"Main Codex가 프로젝트를 시작했습니다: `{request.Name}`"));
             }
+        }
+        finally
+        {
+            _sync.Release();
+        }
+    }
+
+    public async Task OnPlanAdjustedAsync(
+        ProjectRequest request,
+        IReadOnlyList<AgentTask> plannedTasks,
+        int subAgentCount,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        await _sync.WaitAsync(cancellationToken);
+
+        try
+        {
+            if (_mainChannel is null)
+            {
+                return;
+            }
+
+            await SyncSubAgentChannelsAsync(subAgentCount);
+            await _mainChannel.SendMessageAsync(
+                BuildPlanAnnouncement(
+                    request,
+                    plannedTasks,
+                    subAgentCount,
+                    heading: "Main Codex가 계획을 다시 조정했습니다.",
+                    reason: reason));
         }
         finally
         {
@@ -109,8 +110,10 @@ public sealed class DiscordProjectWorkspaceObserver : IExecutionObserver
         {
             ITextChannel? targetChannel = ResolveTargetChannel(executionEvent.AgentName);
             string eventText =
-                $"[{executionEvent.Timestamp:HH:mm:ss}] `{TranslateState(executionEvent.State)}` | " +
-                $"작업 #{executionEvent.TaskId} | 시도 {executionEvent.Attempt} | {executionEvent.Message}";
+                executionEvent.TaskId > 0
+                    ? $"[{executionEvent.Timestamp:HH:mm:ss}] `{TranslateState(executionEvent.State)}` | " +
+                      $"작업 #{executionEvent.TaskId} | 시도 {executionEvent.Attempt} | {executionEvent.Message}"
+                    : $"[{executionEvent.Timestamp:HH:mm:ss}] `{TranslateState(executionEvent.State)}` | {executionEvent.Message}";
 
             if (targetChannel is not null)
             {
@@ -119,9 +122,10 @@ public sealed class DiscordProjectWorkspaceObserver : IExecutionObserver
 
             if (_mainChannel is not null)
             {
-                await _mainChannel.SendMessageAsync(
-                    $"`{executionEvent.AgentName}` | `{TranslateState(executionEvent.State)}` | " +
-                    $"작업 #{executionEvent.TaskId} | 시도 {executionEvent.Attempt}");
+                string summaryLine = executionEvent.TaskId > 0
+                    ? $"`{executionEvent.AgentName}` | `{TranslateState(executionEvent.State)}` | 작업 #{executionEvent.TaskId} | 시도 {executionEvent.Attempt}"
+                    : $"`{executionEvent.AgentName}` | `{TranslateState(executionEvent.State)}`";
+                await _mainChannel.SendMessageAsync(summaryLine);
             }
         }
         finally
@@ -204,6 +208,108 @@ public sealed class DiscordProjectWorkspaceObserver : IExecutionObserver
         return candidate;
     }
 
+    public Task<WorkspaceRouteInfo> WaitForWorkspaceReadyAsync(CancellationToken cancellationToken = default)
+    {
+        return _workspaceReady.Task.WaitAsync(cancellationToken);
+    }
+
+    private async Task SyncSubAgentChannelsAsync(int desiredCount)
+    {
+        if (_category is null)
+        {
+            return;
+        }
+
+        for (int index = 1; index <= desiredCount; index++)
+        {
+            string agentName = $"sub-agent-{index}";
+            if (_agentChannels.ContainsKey(agentName))
+            {
+                continue;
+            }
+
+            ITextChannel subChannel = await _guild.CreateTextChannelAsync(
+                $"sub-codex-{index}",
+                properties =>
+                {
+                    properties.CategoryId = _category.Id;
+                    properties.Topic = BuildChannelTopic(agentName, _workspaceRoot);
+                });
+            _agentChannels[agentName] = subChannel;
+
+            await subChannel.SendMessageAsync(
+                $"`sub-codex-{index}` 준비 완료\n연결된 에이전트 ID: `{agentName}`\n이 채널에 바로 말하면 자동으로 이 서브 에이전트에게 라우팅됩니다.");
+        }
+
+        string[] channelsToRemove = _agentChannels.Keys
+            .Select(name => new
+            {
+                AgentName = name,
+                Index = ParseSubAgentIndex(name)
+            })
+            .Where(item => item.Index > desiredCount)
+            .OrderByDescending(item => item.Index)
+            .Select(item => item.AgentName)
+            .ToArray();
+
+        foreach (string agentName in channelsToRemove)
+        {
+            if (!_agentChannels.TryGetValue(agentName, out ITextChannel? channel))
+            {
+                continue;
+            }
+
+            await channel.DeleteAsync();
+            _agentChannels.Remove(agentName);
+        }
+    }
+
+    private string BuildPlanAnnouncement(
+        ProjectRequest request,
+        IReadOnlyList<AgentTask> plannedTasks,
+        int subAgentCount,
+        string heading,
+        string? reason = null)
+    {
+        var builder = new StringBuilder();
+        int estimatedMinutes = plannedTasks.Sum(task => task.EstimatedMinutes);
+        int maxComplexity = plannedTasks.Count == 0 ? 1 : plannedTasks.Max(task => task.Complexity);
+        builder.AppendLine(heading);
+        builder.AppendLine($"목표: {request.Goal}");
+        if (!string.IsNullOrWhiteSpace(reason))
+        {
+            builder.AppendLine($"재계획 이유: {reason}");
+        }
+        builder.AppendLine($"예상 난이도: `{TranslatePriority(maxComplexity)}`");
+        builder.AppendLine($"예상 소요: `약 {estimatedMinutes}분`");
+        if (subAgentCount == 0)
+        {
+            builder.AppendLine("이번 작업은 Main Codex가 단독으로 처리합니다.");
+        }
+        else
+        {
+            builder.AppendLine($"Sub Codex 수: `{subAgentCount}`");
+            builder.AppendLine("Main Codex가 분석/통합 단계를 맡고, Sub Codex가 병렬 가능한 구현 단계를 맡습니다.");
+        }
+        builder.AppendLine("이 채널에 바로 말하면 Main Codex에게 자동으로 라우팅됩니다.");
+        builder.AppendLine("계획된 작업:");
+
+        foreach (AgentTask task in plannedTasks)
+        {
+            builder.AppendLine(
+                $"- #{task.Id} {task.Title} [{task.Priority}] | " +
+                $"{task.ExecutionLaneLabel} | phase {task.Phase} | 약 {task.EstimatedMinutes}분");
+        }
+
+        return builder.ToString();
+    }
+
+    private static int ParseSubAgentIndex(string agentName)
+    {
+        string[] parts = agentName.Split('-');
+        return parts.Length > 0 && int.TryParse(parts[^1], out int index) ? index : 0;
+    }
+
     public static string BuildChannelTopic(string agentName, string workspaceRoot)
     {
         return
@@ -262,6 +368,7 @@ public sealed class DiscordProjectWorkspaceObserver : IExecutionObserver
             "Started" => "시작",
             "RetryScheduled" => "재시도 예약",
             "Completed" => "완료",
+            "Replanned" => "재계획",
             _ => state
         };
     }

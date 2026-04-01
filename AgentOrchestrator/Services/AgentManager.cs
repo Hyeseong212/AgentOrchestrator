@@ -19,65 +19,125 @@ public sealed class AgentManager
     public async Task<ExecutionReport> ExecuteAsync(
         ProjectRequest request,
         IExecutionObserver? observer,
+        IExecutionAdjustmentSource? adjustmentSource,
         CancellationToken cancellationToken)
     {
         DateTimeOffset generatedAt = DateTimeOffset.Now;
         var history = new ExecutionHistory();
-        IReadOnlyList<AgentTask> tasks = _planner.BuildPlan(request);
-        SubAgent mainAgent = _subAgentFactory.CreateAgent("main-codex");
-        int subTaskCount = tasks.Count(task => string.Equals(task.ExecutionLane, "sub", StringComparison.OrdinalIgnoreCase));
-        int subAgentCount = subTaskCount == 0 ? 0 : _scaler.DetermineAgentCount(subTaskCount);
-        IReadOnlyList<SubAgent> subAgents = subAgentCount == 0
-            ? []
-            : _subAgentFactory.CreateAgents(subAgentCount);
         var results = new List<TaskResult>();
         var sync = new Lock();
+        var requestLoader = new ProjectRequestLoader();
+        var allPlannedTasks = new List<AgentTask>();
+        ProjectRequest currentRequest = request;
+        int nextTaskId = 1;
+        int maxSubAgentCount = 0;
+        bool initialPlan = true;
 
-        if (observer is not null)
+        while (!cancellationToken.IsCancellationRequested)
         {
-            await observer.OnRunStartedAsync(request, tasks, subAgentCount, cancellationToken);
-        }
-
-        foreach (IGrouping<int, AgentTask> phaseGroup in tasks
-                     .OrderBy(task => task.Phase)
-                     .GroupBy(task => task.Phase))
-        {
-            AgentTask[] mainPhaseTasks = phaseGroup
-                .Where(task => string.Equals(task.ExecutionLane, "main", StringComparison.OrdinalIgnoreCase))
-                .OrderBy(task => task.Id)
-                .ToArray();
-            AgentTask[] subPhaseTasks = phaseGroup
-                .Where(task => string.Equals(task.ExecutionLane, "sub", StringComparison.OrdinalIgnoreCase))
-                .OrderBy(task => task.Id)
-                .ToArray();
-
-            foreach (AgentTask task in mainPhaseTasks)
+            IReadOnlyList<AgentTask> tasks = RenumberTasks(_planner.BuildPlan(currentRequest), nextTaskId);
+            if (tasks.Count > 0)
             {
-                TaskResult result = await ExecuteTaskWithRetryAsync(mainAgent, task, history, observer, cancellationToken);
-                lock (sync)
+                nextTaskId = tasks.Max(task => task.Id) + 1;
+                allPlannedTasks.AddRange(tasks);
+            }
+
+            SubAgent mainAgent = _subAgentFactory.CreateAgent("main-codex");
+            int subTaskCount = tasks.Count(task => string.Equals(task.ExecutionLane, "sub", StringComparison.OrdinalIgnoreCase));
+            int subAgentCount = subTaskCount == 0 ? 0 : _scaler.DetermineAgentCount(subTaskCount);
+            IReadOnlyList<SubAgent> subAgents = subAgentCount == 0
+                ? []
+                : _subAgentFactory.CreateAgents(subAgentCount);
+            maxSubAgentCount = Math.Max(maxSubAgentCount, subAgentCount);
+
+            if (observer is not null)
+            {
+                if (initialPlan)
                 {
-                    results.Add(result);
+                    await observer.OnRunStartedAsync(currentRequest, tasks, subAgentCount, cancellationToken);
+                }
+                else
+                {
+                    await observer.OnPlanAdjustedAsync(
+                        currentRequest,
+                        tasks,
+                        subAgentCount,
+                        "추가 요청을 반영해 난도와 소요 시간을 다시 계산하고 계획을 재구성했습니다.",
+                        cancellationToken);
                 }
             }
 
-            if (subPhaseTasks.Length > 0)
+            bool replanned = false;
+
+            foreach (IGrouping<int, AgentTask> phaseGroup in tasks
+                         .OrderBy(task => task.Phase)
+                         .GroupBy(task => task.Phase))
             {
-                var queue = new TaskQueue(subPhaseTasks);
-                Task[] workers = subAgents
-                    .Select(agent => RunWorkerAsync(agent, queue, results, history, sync, observer, cancellationToken))
+                AgentTask[] mainPhaseTasks = phaseGroup
+                    .Where(task => string.Equals(task.ExecutionLane, "main", StringComparison.OrdinalIgnoreCase))
+                    .OrderBy(task => task.Id)
+                    .ToArray();
+                AgentTask[] subPhaseTasks = phaseGroup
+                    .Where(task => string.Equals(task.ExecutionLane, "sub", StringComparison.OrdinalIgnoreCase))
+                    .OrderBy(task => task.Id)
                     .ToArray();
 
-                await Task.WhenAll(workers);
+                foreach (AgentTask task in mainPhaseTasks)
+                {
+                    TaskResult result = await ExecuteTaskWithRetryAsync(mainAgent, task, history, observer, cancellationToken);
+                    lock (sync)
+                    {
+                        results.Add(result);
+                    }
+                }
+
+                if (subPhaseTasks.Length > 0)
+                {
+                    var queue = new TaskQueue(subPhaseTasks);
+                    Task[] workers = subAgents
+                        .Select(agent => RunWorkerAsync(agent, queue, results, history, sync, observer, cancellationToken))
+                        .ToArray();
+
+                    await Task.WhenAll(workers);
+                }
+
+                IReadOnlyList<string> adjustments = adjustmentSource?.DrainPendingAdjustments() ?? [];
+                if (adjustments.Count > 0)
+                {
+                    string mergedGoal = MergeGoals(currentRequest.Goal, adjustments);
+                    currentRequest = requestLoader.CreateAdHocRequest(mergedGoal, currentRequest.Name);
+                    replanned = true;
+
+                    TaskExecutionEvent replanEvent = history.Record(
+                        0,
+                        "main-codex",
+                        "Replanned",
+                        1,
+                        $"추가 요청 {adjustments.Count}건을 반영해 다음 phase부터 계획을 다시 계산합니다.");
+                    if (observer is not null)
+                    {
+                        await observer.OnExecutionEventAsync(replanEvent, cancellationToken);
+                    }
+
+                    break;
+                }
             }
+
+            if (!replanned)
+            {
+                break;
+            }
+
+            initialPlan = false;
         }
 
         return new ExecutionReport
         {
             RunId = $"{generatedAt:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}"[..24],
             ProjectName = request.Name,
-            Goal = request.Goal,
-            SubAgentCount = subAgentCount,
-            PlannedTasks = tasks,
+            Goal = currentRequest.Goal,
+            SubAgentCount = maxSubAgentCount,
+            PlannedTasks = allPlannedTasks,
             Results = results.OrderBy(item => item.TaskId).ToArray(),
             ExecutionTimeline = history.Snapshot(),
             NextSteps =
@@ -88,6 +148,25 @@ public sealed class AgentManager
             ],
             GeneratedAt = generatedAt
         };
+    }
+
+    private static IReadOnlyList<AgentTask> RenumberTasks(IReadOnlyList<AgentTask> tasks, int nextTaskId)
+    {
+        return tasks
+            .Select((task, index) => task with { Id = nextTaskId + index })
+            .ToArray();
+    }
+
+    private static string MergeGoals(string currentGoal, IReadOnlyList<string> adjustments)
+    {
+        IEnumerable<string> normalizedAdjustments = adjustments
+            .Select(item => item.Trim())
+            .Where(item => !string.IsNullOrWhiteSpace(item));
+
+        return string.Join(
+            "\n",
+            new[] { currentGoal.Trim() }
+                .Concat(normalizedAdjustments.Select((item, index) => $"추가 요청 {index + 1}: {item}")));
     }
 
     private async Task RunWorkerAsync(

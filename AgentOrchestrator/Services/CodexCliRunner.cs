@@ -276,6 +276,7 @@ public sealed class CodexCliRunner
         builder.AppendLine("Do not mention that you are an AI model.");
         builder.AppendLine("Use plain text only, 4 sentences max.");
         builder.AppendLine("The machine is Windows-first. Prefer cmd-compatible commands such as dir, type, where, tree /f, and if exist, or explicitly use powershell -NoProfile -Command for PowerShell cmdlets. Never treat cmd.exe /c Get-ChildItem as a valid command.");
+        builder.AppendLine("If host context includes downloaded Discord attachments, use the provided extracted summaries for PPTX/XLSX/PDF files and directly inspect local image paths for visual details when needed.");
         builder.AppendLine($"Working directory: {_workspaceRoot}");
         if (!string.IsNullOrWhiteSpace(_hostContext))
         {

@@ -40,7 +40,7 @@ public sealed class ProjectRequestLoader
         return new ProjectRequestLoadResult(request, requestPath, TemplateCreated: false);
     }
 
-    public ProjectRequest CreateAdHocRequest(string goal)
+    public ProjectRequest CreateAdHocRequest(string goal, string? preferredProjectName = null)
     {
         if (string.IsNullOrWhiteSpace(goal))
         {
@@ -48,7 +48,9 @@ public sealed class ProjectRequestLoader
         }
 
         string trimmedGoal = goal.Trim();
-        string projectName = BuildProjectName(trimmedGoal);
+        string projectName = string.IsNullOrWhiteSpace(preferredProjectName)
+            ? BuildProjectName(trimmedGoal)
+            : preferredProjectName.Trim();
         IReadOnlyList<string> deliverables = BuildDeliverables(trimmedGoal);
 
         return new ProjectRequest(projectName, trimmedGoal, deliverables);

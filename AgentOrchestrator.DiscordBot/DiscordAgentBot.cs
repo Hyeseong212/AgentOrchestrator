@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Text.RegularExpressions;
 using AgentOrchestrator.Models;
 using AgentOrchestrator.Services;
@@ -32,7 +33,8 @@ public sealed class DiscordAgentBot
     private enum ApprovalActionKind
     {
         Ask,
-        Task
+        Task,
+        Adjust
     }
 
     private sealed record AgentChannelRoute(
@@ -43,26 +45,83 @@ public sealed class DiscordAgentBot
     private sealed record PendingApprovalRequest(
         ApprovalActionKind ActionKind,
         string Input,
-        AgentChannelRoute? Route = null);
+        AgentChannelRoute? Route = null,
+        string? HostContext = null);
+    private sealed record PendingWorkspaceDeleteRequest(
+        ulong CategoryId,
+        string CategoryName);
     private sealed record WorkspaceResolution(
         string? WorkspaceRoot,
         string? HostContext,
         bool UseFullAccess,
         bool StopProcessing);
 
+    private sealed class ActiveWorkspaceRun : IExecutionAdjustmentSource
+    {
+        private readonly List<string> _pendingAdjustments = [];
+        private readonly Lock _sync = new();
+
+        public ActiveWorkspaceRun(
+            DiscordProjectWorkspaceObserver observer,
+            string workspaceRoot,
+            bool allowFullAccess,
+            string? hostContext)
+        {
+            Observer = observer;
+            WorkspaceRoot = workspaceRoot;
+            AllowFullAccess = allowFullAccess;
+            HostContext = hostContext;
+        }
+
+        public DiscordProjectWorkspaceObserver Observer { get; }
+        public string WorkspaceRoot { get; }
+        public bool AllowFullAccess { get; }
+        public string? HostContext { get; }
+
+        public void QueueAdjustment(string input)
+        {
+            lock (_sync)
+            {
+                _pendingAdjustments.Add(input.Trim());
+            }
+        }
+
+        public IReadOnlyList<string> DrainPendingAdjustments()
+        {
+            lock (_sync)
+            {
+                if (_pendingAdjustments.Count == 0)
+                {
+                    return [];
+                }
+
+                string[] items = _pendingAdjustments.ToArray();
+                _pendingAdjustments.Clear();
+                return items;
+            }
+        }
+    }
+
     private readonly DiscordSocketClient _client;
-    private bool _slashCommandsRegistered;
+    private bool _legacySlashCommandsCleared;
     private readonly string _commandPrefix;
     private readonly AgentOrchestratorRuntime _runtime;
+    private readonly LocalArtifactInsightBuilder _artifactInsightBuilder;
+    private readonly DiscordMessageInputPreparer _messageInputPreparer;
     private readonly Dictionary<string, string> _activeWorkspaceRoots = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<ulong> _approvedFullAccessUsers = [];
     private readonly Lock _approvalSync = new();
+    private readonly Lock _activeRunSync = new();
     private readonly Dictionary<string, PendingApprovalRequest> _pendingApprovals = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, PendingWorkspaceDeleteRequest> _pendingWorkspaceDeletes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<ulong, ActiveWorkspaceRun> _activeWorkspaceRuns = [];
     private readonly SemaphoreSlim _runLock = new(1, 1);
 
     public DiscordAgentBot(AgentOrchestratorRuntime runtime, DiscordBotSettings settings)
     {
         _runtime = runtime;
+        _artifactInsightBuilder = new LocalArtifactInsightBuilder();
+        _messageInputPreparer = new DiscordMessageInputPreparer(_runtime.WorkspaceRoot, _artifactInsightBuilder);
         _commandPrefix = string.IsNullOrWhiteSpace(settings.CommandPrefix) ? "!" : settings.CommandPrefix;
 
         _client = new DiscordSocketClient(new DiscordSocketConfig
@@ -76,7 +135,6 @@ public sealed class DiscordAgentBot
         _client.Log += OnLogAsync;
         _client.Ready += OnReadyAsync;
         _client.MessageReceived += OnMessageReceivedAsync;
-        _client.SlashCommandExecuted += OnSlashCommandExecutedAsync;
 
         BotToken = settings.BotToken;
     }
@@ -103,10 +161,10 @@ public sealed class DiscordAgentBot
 
     private async Task OnReadyAsync()
     {
-        if (!_slashCommandsRegistered)
+        if (!_legacySlashCommandsCleared)
         {
-            await RegisterSlashCommandsAsync();
-            _slashCommandsRegistered = true;
+            await ClearSlashCommandsAsync();
+            _legacySlashCommandsCleared = true;
         }
 
         Console.WriteLine($"Discord bot ready as {_client.CurrentUser.Username}.");
@@ -136,6 +194,11 @@ public sealed class DiscordAgentBot
             return;
         }
 
+        if (await TryHandleWorkspaceDeleteResponseAsync(message))
+        {
+            return;
+        }
+
         if (await TryHandleApprovalResponseAsync(message))
         {
             return;
@@ -146,7 +209,7 @@ public sealed class DiscordAgentBot
             if (ShouldHandleConversationalMessage(message))
             {
                 string input = NormalizeConversationalInput(message);
-                if (!string.IsNullOrWhiteSpace(input))
+                if (!string.IsNullOrWhiteSpace(input) || message.Attachments.Count > 0)
                 {
                     await HandleConversationalMessageAsync(message, input);
                 }
@@ -217,23 +280,69 @@ public sealed class DiscordAgentBot
 
     private async Task HandleConversationalMessageAsync(SocketUserMessage message, string input)
     {
+        if (LooksLikeWorkspaceDeletionRequest(input))
+        {
+            await HandleWorkspaceDeletionRequestAsync(message);
+            return;
+        }
+
+        PreparedMessageInput prepared = await _messageInputPreparer.PrepareAsync(message, input);
+        bool attachmentOnlyInput = prepared.HasAttachments && !prepared.HasOriginalText;
+
         if (TryResolveAgentChannelRoute(message, out AgentChannelRoute? route))
         {
-            bool? routedFullAccess = await ResolveAccessApprovalAsync(message, ApprovalActionKind.Ask, input, route);
+            if (TryGetActiveWorkspaceRun(message, out ActiveWorkspaceRun? activeRun) &&
+                string.Equals(route.AgentName, "main-codex", StringComparison.OrdinalIgnoreCase) &&
+                (LooksLikeTaskRequest(prepared.BaseInput) || attachmentOnlyInput))
+            {
+                string adjustmentInput = MergeInputWithHostContext(prepared.BaseInput, prepared.HostContext);
+                bool? adjustmentFullAccess = await ResolveAccessApprovalAsync(
+                    message,
+                    ApprovalActionKind.Adjust,
+                    prepared.BaseInput,
+                    adjustmentInput,
+                    route: route);
+                if (adjustmentFullAccess is null)
+                {
+                    return;
+                }
+
+                await HandleActiveRunAdjustmentAsync(message, adjustmentInput, activeRun);
+                return;
+            }
+
+            if (TryGetActiveWorkspaceRun(message, out _) &&
+                !string.Equals(route.AgentName, "main-codex", StringComparison.OrdinalIgnoreCase) &&
+                LooksLikeTaskRequest(prepared.BaseInput))
+            {
+                await message.Channel.SendMessageAsync(
+                    "진행 중 task에 추가 요청을 붙이려면 `main-codex` 채널에 말해 주세요. 그러면 난도를 다시 계산해서 sub 코덱스를 증감합니다.");
+                return;
+            }
+
+            bool? routedFullAccess = await ResolveAccessApprovalAsync(
+                message,
+                ApprovalActionKind.Ask,
+                prepared.BaseInput,
+                prepared.BaseInput,
+                prepared.HostContext,
+                route);
             if (routedFullAccess is null)
             {
                 return;
             }
 
-            await HandleAskCoreAsync(message, input, routedFullAccess.Value, route);
+            await HandleAskCoreAsync(message, prepared.BaseInput, routedFullAccess.Value, route, prepared.HostContext);
             return;
         }
 
-        bool isTaskRequest = LooksLikeTaskRequest(input);
+        bool isTaskRequest = !attachmentOnlyInput && LooksLikeTaskRequest(prepared.BaseInput);
         bool? allowFullAccess = await ResolveAccessApprovalAsync(
             message,
             isTaskRequest ? ApprovalActionKind.Task : ApprovalActionKind.Ask,
-            input);
+            prepared.BaseInput,
+            prepared.BaseInput,
+            prepared.HostContext);
 
         if (allowFullAccess is null)
         {
@@ -251,12 +360,12 @@ public sealed class DiscordAgentBot
             await message.Channel.SendMessageAsync(
                 "이건 작업으로 처리하는 게 맞아 보여요. 프로젝트 워크스페이스를 만들고 바로 진행할게요.");
 
-            await HandleTaskCoreAsync(message, input, allowFullAccess.Value);
+            await HandleTaskCoreAsync(message, prepared.BaseInput, allowFullAccess.Value, prepared.HostContext);
 
             return;
         }
 
-        await HandleAskCoreAsync(message, input, allowFullAccess.Value);
+        await HandleAskCoreAsync(message, prepared.BaseInput, allowFullAccess.Value, messageHostContext: prepared.HostContext);
     }
 
     private Task OnSlashCommandExecutedAsync(SocketSlashCommand command)
@@ -341,36 +450,52 @@ public sealed class DiscordAgentBot
 
     private async Task HandleTaskAsync(SocketUserMessage message, string goal)
     {
-        if (string.IsNullOrWhiteSpace(goal))
+        PreparedMessageInput prepared = await _messageInputPreparer.PrepareAsync(message, goal);
+
+        if (string.IsNullOrWhiteSpace(prepared.BaseInput))
         {
             await message.Channel.SendMessageAsync("사용법: `!task <목표>`");
             return;
         }
 
-        if (LooksLikeQuestion(goal))
+        if (LooksLikeQuestion(prepared.BaseInput))
         {
             await message.Channel.SendMessageAsync(
                 "이 입력은 질문처럼 보여서 답변 모드로 처리할게요. 작업 실행은 `!task <목표>`로 쓰고, 질문은 `!ask <질문>`으로 물어보면 됩니다.");
-            bool? questionFullAccess = await ResolveAccessApprovalAsync(message, ApprovalActionKind.Ask, goal);
+            bool? questionFullAccess = await ResolveAccessApprovalAsync(
+                message,
+                ApprovalActionKind.Ask,
+                prepared.BaseInput,
+                prepared.BaseInput,
+                prepared.HostContext);
             if (questionFullAccess is null)
             {
                 return;
             }
 
-            await HandleAskCoreAsync(message, goal, questionFullAccess.Value);
+            await HandleAskCoreAsync(message, prepared.BaseInput, questionFullAccess.Value, messageHostContext: prepared.HostContext);
             return;
         }
 
-        bool? allowFullAccess = await ResolveAccessApprovalAsync(message, ApprovalActionKind.Task, goal);
+        bool? allowFullAccess = await ResolveAccessApprovalAsync(
+            message,
+            ApprovalActionKind.Task,
+            prepared.BaseInput,
+            prepared.BaseInput,
+            prepared.HostContext);
         if (allowFullAccess is null)
         {
             return;
         }
 
-        await HandleTaskCoreAsync(message, goal, allowFullAccess.Value);
+        await HandleTaskCoreAsync(message, prepared.BaseInput, allowFullAccess.Value, prepared.HostContext);
     }
 
-    private async Task HandleTaskCoreAsync(SocketUserMessage message, string goal, bool allowFullAccess)
+    private async Task HandleTaskCoreAsync(
+        SocketUserMessage message,
+        string goal,
+        bool allowFullAccess,
+        string? messageHostContext = null)
     {
         if (!await _runLock.WaitAsync(TimeSpan.Zero))
         {
@@ -395,7 +520,11 @@ public sealed class DiscordAgentBot
                 return;
             }
 
-            WorkspaceResolution workspace = await ResolveWorkspaceAsync(message, goal, allowFullAccess);
+            WorkspaceResolution workspace = await ResolveWorkspaceAsync(
+                message,
+                goal,
+                allowFullAccess,
+                defaultHostContext: messageHostContext);
             if (workspace.StopProcessing)
             {
                 return;
@@ -409,13 +538,37 @@ public sealed class DiscordAgentBot
                     : $"\n작업 기준 폴더: `{workspace.WorkspaceRoot}`") +
                 (workspace.UseFullAccess ? "\n이번 실행은 승인된 full access 모드로 진행합니다." : string.Empty));
 
-            OrchestratorRunResult runResult = await RunTaskInGuildAsync(
+            string activeWorkspaceRoot = workspace.WorkspaceRoot ?? _runtime.WorkspaceRoot;
+            var observer = new DiscordProjectWorkspaceObserver(guildChannel.Guild, activeWorkspaceRoot, message.Author.Id);
+            var activeRun = new ActiveWorkspaceRun(observer, activeWorkspaceRoot, workspace.UseFullAccess, workspace.HostContext);
+            Task<OrchestratorRunResult> runTask = RunTaskInGuildAsync(
                 guildChannel.Guild,
                 goal,
                 workspace.UseFullAccess,
+                observer,
                 workspace.WorkspaceRoot,
                 workspace.HostContext,
+                activeRun,
                 message.Author.Id);
+            DiscordProjectWorkspaceObserver.WorkspaceRouteInfo? routeInfo = await WaitForWorkspaceReadyAsync(observer, runTask);
+
+            if (routeInfo is not null)
+            {
+                RegisterActiveWorkspaceRun(routeInfo.CategoryId, activeRun);
+            }
+
+            OrchestratorRunResult runResult;
+            try
+            {
+                runResult = await runTask;
+            }
+            finally
+            {
+                if (routeInfo is not null)
+                {
+                    UnregisterActiveWorkspaceRun(routeInfo.CategoryId);
+                }
+            }
             string summary = BuildRunCompletionSummary(runResult);
 
             await using var reportStream = File.OpenRead(runResult.Artifacts.TextReportPath);
@@ -470,12 +623,34 @@ public sealed class DiscordAgentBot
             await command.FollowupAsync(
                 $"작업 실행을 시작합니다: `{goal}`\n" +
                 "프로젝트 카테고리와 `main-codex` 채널을 만들고, 일이 커지면 `sub-codex-*` 채널도 추가해서 진행 기록을 남길게요.");
-
-            OrchestratorRunResult runResult = await RunTaskInGuildAsync(
+            var observer = new DiscordProjectWorkspaceObserver(guildChannel.Guild, _runtime.WorkspaceRoot, command.User.Id);
+            var activeRun = new ActiveWorkspaceRun(observer, _runtime.WorkspaceRoot, allowFullAccess: false, hostContext: null);
+            Task<OrchestratorRunResult> runTask = RunTaskInGuildAsync(
                 guildChannel.Guild,
                 goal,
                 allowFullAccess: false,
-                requesterUserId: command.User.Id);
+                observer,
+                requesterUserId: command.User.Id,
+                adjustmentSource: activeRun);
+            DiscordProjectWorkspaceObserver.WorkspaceRouteInfo? routeInfo = await WaitForWorkspaceReadyAsync(observer, runTask);
+
+            if (routeInfo is not null)
+            {
+                RegisterActiveWorkspaceRun(routeInfo.CategoryId, activeRun);
+            }
+
+            OrchestratorRunResult runResult;
+            try
+            {
+                runResult = await runTask;
+            }
+            finally
+            {
+                if (routeInfo is not null)
+                {
+                    UnregisterActiveWorkspaceRun(routeInfo.CategoryId);
+                }
+            }
             string summary = BuildRunCompletionSummary(runResult);
 
             await using var reportStream = File.OpenRead(runResult.Artifacts.TextReportPath);
@@ -492,7 +667,9 @@ public sealed class DiscordAgentBot
 
     private async Task HandleAskAsync(SocketUserMessage message, string question)
     {
-        if (string.IsNullOrWhiteSpace(question))
+        PreparedMessageInput prepared = await _messageInputPreparer.PrepareAsync(message, question);
+
+        if (string.IsNullOrWhiteSpace(prepared.BaseInput))
         {
             await message.Channel.SendMessageAsync("사용법: `!ask <질문>`");
             return;
@@ -502,27 +679,34 @@ public sealed class DiscordAgentBot
             ? resolvedRoute
             : null;
 
-        bool? allowFullAccess = await ResolveAccessApprovalAsync(message, ApprovalActionKind.Ask, question, route);
+        bool? allowFullAccess = await ResolveAccessApprovalAsync(
+            message,
+            ApprovalActionKind.Ask,
+            prepared.BaseInput,
+            prepared.BaseInput,
+            prepared.HostContext,
+            route);
         if (allowFullAccess is null)
         {
             return;
         }
 
-        await HandleAskCoreAsync(message, question, allowFullAccess.Value, route);
+        await HandleAskCoreAsync(message, prepared.BaseInput, allowFullAccess.Value, route, prepared.HostContext);
     }
 
     private async Task HandleAskCoreAsync(
         SocketUserMessage message,
         string question,
         bool allowFullAccess,
-        AgentChannelRoute? route = null)
+        AgentChannelRoute? route = null,
+        string? messageHostContext = null)
     {
         WorkspaceResolution workspace = await ResolveWorkspaceAsync(
             message,
             question,
             allowFullAccess,
             route?.WorkspaceRoot,
-            route?.HostContext);
+            CombineHostContexts(route?.HostContext, messageHostContext));
         if (workspace.StopProcessing)
         {
             return;
@@ -674,9 +858,10 @@ public sealed class DiscordAgentBot
     {
         return
             $"Commands:\n" +
-            "- 슬래시 커맨드 `/`를 입력하면 Discord 입력창에서 명령 목록이 바로 보여요.\n" +
             "- `일반/general`, DM, 또는 봇을 멘션한 메시지에서는 그냥 대화해도 됩니다. 질문이면 답하고, 작업 요청처럼 보이면 자동으로 프로젝트 워크스페이스를 만들고 진행해요.\n" +
+            "- 이미지, PPTX, XLSX, PDF 같은 Discord 첨부파일도 같이 보내면 로컬에 저장하고 내용을 추출해서 함께 반영해요.\n" +
             "- 프로젝트 워크스페이스 안의 `main-codex`, `sub-codex-*` 채널에 바로 말하면 그 채널에 연결된 agent로 자동 라우팅됩니다.\n" +
+            "- 워크스페이스 채널 안에서 카테고리/채널 삭제를 요청하면 현재 프로젝트만 지우도록 확인 절차를 거쳐 처리할 수 있어요.\n" +
             $"- `{_commandPrefix}ask <question>`\n" +
             $"- `{_commandPrefix}capabilities`\n" +
             $"- `{_commandPrefix}task <goal>` 프로젝트 카테고리와 main/sub codex 채널 생성\n" +
@@ -684,20 +869,20 @@ public sealed class DiscordAgentBot
             $"- `{_commandPrefix}history`\n" +
             $"- `{_commandPrefix}report <runId>`\n" +
             $"- `{_commandPrefix}request`\n" +
-            $"- `{_commandPrefix}help`\n" +
-            "또는 `/ask`, `/task`, `/status`, `/history`, `/report`, `/request`, `/help`를 사용할 수 있어요.";
+            $"- `{_commandPrefix}help`";
     }
 
     private string BuildCapabilitiesText()
     {
         return
             "지금 이 봇은 두 가지를 할 수 있어요.\n" +
-            $"- `{_commandPrefix}task <목표>` 또는 `/task`: 프로젝트 카테고리와 `main-codex` 채널을 만들고, 일이 커지면 `sub-codex-*`도 추가로 만들어서 진행 기록과 report를 남김\n" +
-            $"- `{_commandPrefix}ask <질문>` 또는 `/ask`: 바로 질문에 짧게 답변\n" +
+            $"- `{_commandPrefix}task <목표>`: 프로젝트 카테고리와 `main-codex` 채널을 만들고, 일이 커지면 `sub-codex-*`도 추가로 만들어서 진행 기록과 report를 남김\n" +
+            $"- `{_commandPrefix}ask <질문>`: 바로 질문에 짧게 답변\n" +
             "- 만들어진 `main-codex`와 `sub-codex-*` 채널에 바로 말하면 해당 Main/Sub Codex로 자동 라우팅\n" +
+            "- Discord 첨부파일을 자동 저장하고, 이미지/PPTX/XLSX/PDF는 내용을 읽거나 직접 볼 수 있게 문맥으로 붙여줌\n" +
+            "- 워크스페이스 삭제 요청을 받으면 현재 카테고리만 확인 후 정리 가능\n" +
             "- 일반 채널에서 그냥 대화해도 돼요. 질문이면 답하고, 작업 요청이면 스스로 작업으로 전환해요.\n" +
-            $"- `{_commandPrefix}status`, `{_commandPrefix}history`, `{_commandPrefix}report <runId>`, `{_commandPrefix}request`도 사용할 수 있어요.\n" +
-            "- 입력창에서 명령 목록 자동완성을 보려면 `!`가 아니라 `/`를 사용해야 해요.";
+            $"- `{_commandPrefix}status`, `{_commandPrefix}history`, `{_commandPrefix}report <runId>`, `{_commandPrefix}request`도 사용할 수 있어요.";
     }
 
     private static bool LooksLikeQuestion(string input)
@@ -760,6 +945,33 @@ public sealed class DiscordAgentBot
         ];
 
         return taskKeywords.Any(keyword => trimmed.Contains(keyword, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool LooksLikeWorkspaceDeletionRequest(string input)
+    {
+        string trimmed = input.Trim();
+        if (string.IsNullOrWhiteSpace(trimmed))
+        {
+            return false;
+        }
+
+        bool hasDeleteVerb =
+            trimmed.Contains("삭제", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.Contains("지워", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.Contains("정리", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.Contains("닫아", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.Contains("remove", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.Contains("delete", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.Contains("cleanup", StringComparison.OrdinalIgnoreCase);
+        bool hasWorkspaceTarget =
+            trimmed.Contains("카테고리", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.Contains("채널", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.Contains("워크스페이스", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.Contains("프로젝트", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.Contains("workspace", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.Contains("project", StringComparison.OrdinalIgnoreCase);
+
+        return hasDeleteVerb && hasWorkspaceTarget;
     }
 
     private static bool HasWorkspacePermissions(SocketGuildChannel guildChannel)
@@ -827,7 +1039,9 @@ public sealed class DiscordAgentBot
             .Trim();
     }
 
-    private bool TryResolveAgentChannelRoute(SocketUserMessage message, out AgentChannelRoute? route)
+    private bool TryResolveAgentChannelRoute(
+        SocketUserMessage message,
+        [NotNullWhen(true)] out AgentChannelRoute? route)
     {
         route = null;
 
@@ -849,6 +1063,40 @@ public sealed class DiscordAgentBot
             workspaceRoot,
             BuildAgentChannelHostContext(textChannel, agentName, workspaceRoot),
             RequiresFullAccessForWorkspace(workspaceRoot));
+        return true;
+    }
+
+    private bool TryResolveManagedWorkspaceCategory(
+        SocketUserMessage message,
+        [NotNullWhen(true)] out SocketCategoryChannel? category)
+    {
+        category = null;
+
+        if (message.Channel is not SocketTextChannel textChannel ||
+            textChannel.CategoryId is not ulong categoryId)
+        {
+            return false;
+        }
+
+        SocketCategoryChannel? candidate = textChannel.Guild.CategoryChannels
+            .FirstOrDefault(item => item.Id == categoryId);
+        if (candidate is null)
+        {
+            return false;
+        }
+
+        bool hasManagedMainChannel = textChannel.Guild.TextChannels.Any(channel =>
+            channel.CategoryId == categoryId &&
+            string.Equals(channel.Name, "main-codex", StringComparison.OrdinalIgnoreCase) &&
+            DiscordProjectWorkspaceObserver.TryParseChannelTopic(channel.Topic, out string agentName, out _ ) &&
+            string.Equals(agentName, "main-codex", StringComparison.OrdinalIgnoreCase));
+
+        if (!hasManagedMainChannel)
+        {
+            return false;
+        }
+
+        category = candidate;
         return true;
     }
 
@@ -918,14 +1166,16 @@ public sealed class DiscordAgentBot
     private async Task<bool?> ResolveAccessApprovalAsync(
         SocketUserMessage message,
         ApprovalActionKind actionKind,
-        string input,
+        string approvalInput,
+        string pendingInput,
+        string? hostContext = null,
         AgentChannelRoute? route = null)
     {
-        string approvalInput = route is { RequiresFullAccess: true }
-            ? $"{route.WorkspaceRoot}\n{input}"
-            : input;
+        string scopedApprovalInput = route is { RequiresFullAccess: true }
+            ? $"{route.WorkspaceRoot}\n{approvalInput}"
+            : approvalInput;
 
-        if (!RequiresSensitiveLocalAccess(approvalInput))
+        if (!RequiresSensitiveLocalAccess(scopedApprovalInput))
         {
             return false;
         }
@@ -937,7 +1187,8 @@ public sealed class DiscordAgentBot
                 return true;
             }
 
-            _pendingApprovals[BuildPendingApprovalKey(message)] = new PendingApprovalRequest(actionKind, input, route);
+            _pendingApprovals[BuildPendingApprovalKey(message)] =
+                new PendingApprovalRequest(actionKind, pendingInput, route, hostContext);
         }
 
         await message.Channel.SendMessageAsync(
@@ -946,6 +1197,92 @@ public sealed class DiscordAgentBot
             "`승인` 또는 `취소`라고 답해주세요.");
 
         return null;
+    }
+
+    private async Task HandleWorkspaceDeletionRequestAsync(SocketUserMessage message)
+    {
+        if (!TryResolveManagedWorkspaceCategory(message, out SocketCategoryChannel? category))
+        {
+            await message.Channel.SendMessageAsync(
+                "워크스페이스 삭제는 `main-codex`나 `sub-codex-*` 같은 현재 프로젝트 채널 안에서만 할 수 있어요.");
+            return;
+        }
+
+        if (IsWorkspaceRunActive(category.Id))
+        {
+            await message.Channel.SendMessageAsync(
+                "지금은 이 워크스페이스에서 task가 실행 중이라 바로 삭제할 수 없어요. 실행이 끝난 뒤 다시 요청해 주세요.");
+            return;
+        }
+
+        lock (_approvalSync)
+        {
+            _pendingWorkspaceDeletes[BuildPendingApprovalKey(message)] =
+                new PendingWorkspaceDeleteRequest(category.Id, category.Name);
+        }
+
+        await message.Channel.SendMessageAsync(
+            $"현재 워크스페이스 `{category.Name}` 전체를 삭제할까요?\n" +
+            "카테고리 아래의 `main-codex`, `sub-codex-*` 채널도 함께 삭제됩니다.\n" +
+            "`삭제확인` 또는 `취소`라고 답해주세요.");
+    }
+
+    private async Task<bool> TryHandleWorkspaceDeleteResponseAsync(SocketUserMessage message)
+    {
+        PendingWorkspaceDeleteRequest? pendingDelete;
+
+        lock (_approvalSync)
+        {
+            _pendingWorkspaceDeletes.TryGetValue(BuildPendingApprovalKey(message), out pendingDelete);
+        }
+
+        if (pendingDelete is null)
+        {
+            return false;
+        }
+
+        string normalized = NormalizeApprovalDecision(message.Content);
+        if (IsWorkspaceDeleteConfirmed(normalized))
+        {
+            lock (_approvalSync)
+            {
+                _pendingWorkspaceDeletes.Remove(BuildPendingApprovalKey(message));
+            }
+
+            SocketCategoryChannel? category = (message.Channel as SocketGuildChannel)?.Guild.CategoryChannels
+                .FirstOrDefault(item => item.Id == pendingDelete.CategoryId);
+            if (category is null)
+            {
+                await message.Channel.SendMessageAsync("삭제하려던 워크스페이스를 찾지 못했어요. 이미 지워졌을 수 있어요.");
+                return true;
+            }
+
+            if (IsWorkspaceRunActive(category.Id))
+            {
+                await message.Channel.SendMessageAsync(
+                    "확인하는 사이에 새 task가 시작돼서 지금은 삭제할 수 없어요. 실행이 끝난 뒤 다시 요청해 주세요.");
+                return true;
+            }
+
+            await message.Channel.SendMessageAsync(
+                $"`{category.Name}` 워크스페이스를 삭제합니다. 이 채널도 곧 함께 사라져요.");
+            await DeleteWorkspaceCategoryAsync(category);
+            return true;
+        }
+
+        if (IsApprovalRejected(normalized))
+        {
+            lock (_approvalSync)
+            {
+                _pendingWorkspaceDeletes.Remove(BuildPendingApprovalKey(message));
+            }
+
+            await message.Channel.SendMessageAsync("워크스페이스 삭제를 취소했어요.");
+            return true;
+        }
+
+        await message.Channel.SendMessageAsync("삭제 대기 중인 요청이 있어요. `삭제확인` 또는 `취소`라고 답해주세요.");
+        return true;
     }
 
     private async Task<bool> TryHandleApprovalResponseAsync(SocketUserMessage message)
@@ -993,6 +1330,26 @@ public sealed class DiscordAgentBot
         return true;
     }
 
+    private async Task DeleteWorkspaceCategoryAsync(SocketCategoryChannel category)
+    {
+        lock (_activeRunSync)
+        {
+            _activeWorkspaceRuns.Remove(category.Id);
+        }
+
+        SocketTextChannel[] channels = category.Guild.TextChannels
+            .Where(channel => channel.CategoryId == category.Id)
+            .OrderByDescending(channel => channel.Name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        foreach (SocketTextChannel channel in channels)
+        {
+            await channel.DeleteAsync();
+        }
+
+        await category.DeleteAsync();
+    }
+
     private async Task ExecuteApprovedRequestAsync(SocketUserMessage message, PendingApprovalRequest pendingRequest)
     {
         AgentChannelRoute? route = pendingRequest.Route;
@@ -1005,10 +1362,16 @@ public sealed class DiscordAgentBot
         switch (pendingRequest.ActionKind)
         {
             case ApprovalActionKind.Ask:
-                await HandleAskCoreAsync(message, pendingRequest.Input, allowFullAccess: true, route);
+                await HandleAskCoreAsync(message, pendingRequest.Input, allowFullAccess: true, route, pendingRequest.HostContext);
                 break;
             case ApprovalActionKind.Task:
-                await HandleTaskCoreAsync(message, pendingRequest.Input, allowFullAccess: true);
+                await HandleTaskCoreAsync(message, pendingRequest.Input, allowFullAccess: true, pendingRequest.HostContext);
+                break;
+            case ApprovalActionKind.Adjust:
+                if (TryGetActiveWorkspaceRun(message, out ActiveWorkspaceRun? activeRun))
+                {
+                    await HandleActiveRunAdjustmentAsync(message, pendingRequest.Input, activeRun);
+                }
                 break;
         }
     }
@@ -1183,6 +1546,13 @@ public sealed class DiscordAgentBot
         return $"{first}\n{second}";
     }
 
+    private static string MergeInputWithHostContext(string input, string? hostContext)
+    {
+        return string.IsNullOrWhiteSpace(hostContext)
+            ? input
+            : $"{input}\n\n[Discord attachment context]\n{hostContext}";
+    }
+
     private static string? ExtractLocalPath(string input)
     {
         foreach (string line in input.ReplaceLineEndings("\n").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
@@ -1322,6 +1692,11 @@ public sealed class DiscordAgentBot
         return normalized is "취소" or "거절" or "no" or "n" or "ㄴㄴ";
     }
 
+    private static bool IsWorkspaceDeleteConfirmed(string normalized)
+    {
+        return normalized is "삭제확인" or "삭제 확인" or "confirm delete" or "delete confirm";
+    }
+
     private static string BuildAskStartedMessage(bool allowFullAccess, string? workspaceRoot, string? agentName = null)
     {
         string routeText = string.IsNullOrWhiteSpace(agentName)
@@ -1383,15 +1758,86 @@ public sealed class DiscordAgentBot
         SocketGuild guild,
         string goal,
         bool allowFullAccess,
+        DiscordProjectWorkspaceObserver observer,
         string? workspaceRootOverride = null,
         string? hostContext = null,
+        IExecutionAdjustmentSource? adjustmentSource = null,
         ulong? requesterUserId = null)
     {
-        string workspaceRoot = string.IsNullOrWhiteSpace(workspaceRootOverride)
-            ? _runtime.WorkspaceRoot
-            : workspaceRootOverride;
-        var observer = new DiscordProjectWorkspaceObserver(guild, workspaceRoot, requesterUserId);
-        return _runtime.RunAdHocAsync(goal, observer, allowFullAccess, workspaceRootOverride, hostContext);
+        return _runtime.RunAdHocAsync(goal, observer, allowFullAccess, workspaceRootOverride, hostContext, adjustmentSource);
+    }
+
+    private async Task HandleActiveRunAdjustmentAsync(
+        SocketUserMessage message,
+        string input,
+        ActiveWorkspaceRun activeRun)
+    {
+        activeRun.QueueAdjustment(input);
+        await message.Channel.SendMessageAsync(
+            "추가 요청 받았어요. 현재 단계가 끝나는 즉시 난도와 예상 소요를 다시 계산해서 계획을 재배치하고, 필요하면 `sub-codex-*` 채널을 동적으로 생성/정리할게요.");
+    }
+
+    private bool TryGetActiveWorkspaceRun(
+        SocketUserMessage message,
+        [NotNullWhen(true)] out ActiveWorkspaceRun? activeRun)
+    {
+        activeRun = null;
+
+        if (message.Channel is not SocketTextChannel textChannel || textChannel.CategoryId is not ulong categoryId)
+        {
+            return false;
+        }
+
+        lock (_activeRunSync)
+        {
+            return _activeWorkspaceRuns.TryGetValue(categoryId, out activeRun);
+        }
+    }
+
+    private bool IsWorkspaceRunActive(ulong categoryId)
+    {
+        lock (_activeRunSync)
+        {
+            return _activeWorkspaceRuns.ContainsKey(categoryId);
+        }
+    }
+
+    private void RegisterActiveWorkspaceRun(ulong categoryId, ActiveWorkspaceRun activeRun)
+    {
+        lock (_activeRunSync)
+        {
+            _activeWorkspaceRuns[categoryId] = activeRun;
+        }
+    }
+
+    private void UnregisterActiveWorkspaceRun(ulong categoryId)
+    {
+        lock (_activeRunSync)
+        {
+            _activeWorkspaceRuns.Remove(categoryId);
+        }
+    }
+
+    private static async Task<DiscordProjectWorkspaceObserver.WorkspaceRouteInfo?> WaitForWorkspaceReadyAsync(
+        DiscordProjectWorkspaceObserver observer,
+        Task<OrchestratorRunResult> runTask)
+    {
+        Task<DiscordProjectWorkspaceObserver.WorkspaceRouteInfo> readyTask = observer.WaitForWorkspaceReadyAsync();
+        Task completedTask = await Task.WhenAny(runTask, readyTask);
+        if (completedTask == readyTask)
+        {
+            return await readyTask;
+        }
+
+        return null;
+    }
+
+    private async Task ClearSlashCommandsAsync()
+    {
+        foreach (SocketGuild guild in _client.Guilds)
+        {
+            await guild.BulkOverwriteApplicationCommandAsync(Array.Empty<ApplicationCommandProperties>());
+        }
     }
 
     private async Task RegisterSlashCommandsAsync()

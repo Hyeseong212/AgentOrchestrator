@@ -14,6 +14,13 @@ public interface IExecutionObserver
         TaskExecutionEvent executionEvent,
         CancellationToken cancellationToken);
 
+    Task OnPlanAdjustedAsync(
+        ProjectRequest request,
+        IReadOnlyList<AgentTask> plannedTasks,
+        int subAgentCount,
+        string reason,
+        CancellationToken cancellationToken);
+
     Task OnRunCompletedAsync(
         OrchestratorRunResult runResult,
         CancellationToken cancellationToken);

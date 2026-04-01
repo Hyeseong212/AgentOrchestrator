@@ -45,6 +45,7 @@ public sealed class AgentOrchestratorRuntime
             observer: null,
             workspaceRootOverride: null,
             hostContext: null,
+            adjustmentSource: null,
             cancellationToken);
     }
 
@@ -60,6 +61,7 @@ public sealed class AgentOrchestratorRuntime
             observer: null,
             workspaceRootOverride: null,
             hostContext: null,
+            adjustmentSource: null,
             cancellationToken);
     }
 
@@ -69,6 +71,7 @@ public sealed class AgentOrchestratorRuntime
         bool allowFullAccess = false,
         string? workspaceRootOverride = null,
         string? hostContext = null,
+        IExecutionAdjustmentSource? adjustmentSource = null,
         CancellationToken cancellationToken = default)
     {
         ProjectRequest request = _requestLoader.CreateAdHocRequest(goal);
@@ -81,6 +84,7 @@ public sealed class AgentOrchestratorRuntime
             observer,
             workspaceRootOverride,
             hostContext,
+            adjustmentSource,
             cancellationToken);
     }
 
@@ -121,10 +125,11 @@ public sealed class AgentOrchestratorRuntime
         IExecutionObserver? observer,
         string? workspaceRootOverride,
         string? hostContext,
+        IExecutionAdjustmentSource? adjustmentSource,
         CancellationToken cancellationToken)
     {
         MainAgent mainAgent = CreateMainAgent(allowFullAccess, workspaceRootOverride, hostContext);
-        ExecutionReport report = await mainAgent.RunProjectAsync(request, observer, cancellationToken);
+        ExecutionReport report = await mainAgent.RunProjectAsync(request, observer, adjustmentSource, cancellationToken);
         RunArtifacts artifacts = await _artifactsWriter.WriteAsync(_projectRoot, report, cancellationToken);
 
         var runResult = new OrchestratorRunResult(report, artifacts, requestSource, requestSourceMessage);
@@ -181,6 +186,7 @@ public sealed class AgentOrchestratorRuntime
             personaGuidance +
             "Keep the answer practical and short. " +
             "The machine is Windows-first. When referring to local inspection, prefer cmd-compatible commands such as dir, type, where, tree /f, and if exist, or explicitly use powershell -NoProfile -Command for PowerShell cmdlets. Never describe cmd.exe /c Get-ChildItem as a valid command because Get-ChildItem is not a cmd built-in. " +
+            "If the host context includes downloaded Discord attachments, rely on the extracted PPTX/XLSX/PDF summaries and inspect local image paths directly for visual details when useful. " +
             $"The active working directory for this request is `{activeWorkspaceRoot}`. " +
             accessGuidance +
             (string.IsNullOrWhiteSpace(hostContext) ? string.Empty : $"\nHost context: {hostContext}") +

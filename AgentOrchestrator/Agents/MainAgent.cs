@@ -15,8 +15,9 @@ public sealed class MainAgent
     public Task<ExecutionReport> RunProjectAsync(
         ProjectRequest request,
         IExecutionObserver? observer = null,
+        IExecutionAdjustmentSource? adjustmentSource = null,
         CancellationToken cancellationToken = default)
     {
-        return _manager.ExecuteAsync(request, observer, cancellationToken);
+        return _manager.ExecuteAsync(request, observer, adjustmentSource, cancellationToken);
     }
 }
